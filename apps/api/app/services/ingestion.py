@@ -64,19 +64,33 @@ async def ingest_document(
     ocr_provider: OCRProvider | None = None,
     normalizer: ClinicalNormalizer | None = None,
 ) -> IngestionResult:
-    ocr_provider = ocr_provider or DemoOCRProvider()
-    normalizer = normalizer or ClinicalNormalizer()
+    if ocr_provider is None or normalizer is None:
+        from .nvidia_providers import build_default_providers
+
+        default_ocr, default_normalizer = build_default_providers()
+        ocr_provider = ocr_provider or default_ocr
+        normalizer = normalizer or default_normalizer
+
+    from .auth_store import get_store
 
     digest = sha256(content).hexdigest()
     artifact_id = f"art_{uuid4().hex[:12]}"
+    store = get_store()
+    saved = store.save_artifact_file(
+        patient_id=patient_id,
+        artifact_id=artifact_id,
+        file_name=file_name,
+        media_type=media_type,
+        content=content,
+    )
 
     artifact = SourceArtifact(
         artifact_id=artifact_id,
         patient_id=patient_id,
-        file_name=file_name,
+        file_name=saved.file_name,
         media_type=media_type,
         sha256=digest,
-        storage_uri=f"local://uploads/{artifact_id}/{file_name}",
+        storage_uri=saved.storage_path,
     )
 
     ocr = await ocr_provider.recognize(content, media_type)
@@ -91,14 +105,34 @@ async def ingest_document(
     steps = [
         "upload_complete",
         "sha256_dedup_key_created",
+        "source_file_saved",
         "ocr_complete",
-        "document_classification_pending",
-        "llm_normalization_pending",
     ]
+    status: str = "ocr_complete"
+
+    if event is not None:
+        steps.extend(
+            [
+                "document_classification_complete",
+                "llm_normalization_complete",
+            ]
+        )
+        status = "needs_review"
+        artifact.document_type = event.event_type
+        artifact.document_time = event.event_time
+        artifact.institution = event.institution
+    else:
+        steps.extend(
+            [
+                "document_classification_pending",
+                "llm_normalization_pending",
+            ]
+        )
+        status = "needs_review"
 
     return IngestionResult(
         artifact=artifact,
-        status="needs_review",
+        status=status,  # type: ignore[arg-type]
         pipeline_steps=steps,
         extracted_event=event,
     )

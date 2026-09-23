@@ -24,6 +24,7 @@ export type TimelineEvent = {
   summary: string;
   facts: Fact[];
   source: string;
+  artifactId?: string;
 };
 
 export type TrendPoint = {

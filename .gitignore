@@ -5,6 +5,12 @@ __pycache__/
 venv/
 .env
 
+# Local secrets
+github_token.txt
+nvidia_key.txt
+*_token.txt
+*_key.txt
+
 # Node
 node_modules/
 dist/

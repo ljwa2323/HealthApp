@@ -170,3 +170,63 @@ class AgentContext(BaseModel):
     events: list[dict[str, Any]]
     data_gaps: list[str]
     evidence_refs: list[str]
+
+
+class EventCorrectionRequest(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    institution: str | None = None
+    event_time_start: str | None = None
+    facts: list[dict[str, Any]] | None = None
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    display_name: str
+    sex: Literal["female", "male", "other", "unknown"] = "unknown"
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class AuthUser(BaseModel):
+    user_id: str
+    email: str
+    display_name: str
+    patient_id: str
+    sex: Literal["female", "male", "other", "unknown"] = "unknown"
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: AuthUser
+
+
+class AssistantChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class AssistantAnalyzeRequest(BaseModel):
+    task: str = "general_longitudinal_review"
+
+
+class AssistantChatRequest(BaseModel):
+    question: str
+    history: list[AssistantChatMessage] = Field(default_factory=list)
+    task: str = "general_longitudinal_review"
+
+
+class AssistantReply(BaseModel):
+    answer: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    used_fact_ids: list[str] = Field(default_factory=list)
+    context: dict[str, Any] | None = None
