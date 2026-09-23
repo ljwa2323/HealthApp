@@ -32,6 +32,14 @@ class Concept(BaseModel):
     local_code: str | None = None
 
 
+class OCRBlock(BaseModel):
+    block_id: str
+    page: int | None = None
+    text: str
+    bbox: list[float] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class EvidencePointer(BaseModel):
     artifact_id: str
     page: int | None = None
@@ -121,7 +129,9 @@ class SourceArtifact(BaseModel):
     institution: str | None = None
     sha256: str | None = None
     storage_uri: str | None = None
+    ocr_engine: str | None = None
     ocr_text: str | None = None
+    ocr_blocks: list[OCRBlock] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
