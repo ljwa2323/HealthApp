@@ -1,0 +1,175 @@
+{
+  "patient": {
+    "patient_id": "p_demo_001",
+    "display_name": "Demo Patient",
+    "sex": "female",
+    "birth_date": "1989-05-12"
+  },
+  "events": [
+    {
+      "event_id": "evt_20250108_lab",
+      "patient_id": "p_demo_001",
+      "event_type": "laboratory",
+      "title": "肾功能检查",
+      "event_time": {
+        "start": "2025-01-08T09:12:00+08:00",
+        "end": null,
+        "precision": "minute",
+        "source": "document"
+      },
+      "institution": "示例医院",
+      "source_artifact_ids": ["art_lab_20250108"],
+      "facts": [
+        {
+          "fact_id": "fact_cr_20250108",
+          "kind": "observation",
+          "concept": {
+            "display": "肌酐",
+            "system": "LOINC",
+            "code": "2160-0",
+            "local_display": "肌酐",
+            "local_code": null
+          },
+          "value": {
+            "type": "quantity",
+            "number": 76,
+            "unit": "umol/L"
+          },
+          "reference_range": {
+            "low": 41,
+            "high": 81,
+            "unit": "umol/L",
+            "text": null
+          },
+          "interpretation": "normal",
+          "time": {
+            "start": "2025-01-08T09:12:00+08:00",
+            "end": null,
+            "precision": "minute",
+            "source": "document"
+          },
+          "evidence": [
+            {
+              "artifact_id": "art_lab_20250108",
+              "page": 1,
+              "block_id": "b17",
+              "quote": "肌酐 76 umol/L 41-81"
+            }
+          ],
+          "confidence": 0.99,
+          "status": "confirmed",
+          "attributes": {}
+        }
+      ],
+      "summary": "肾功能检查，肌酐在参考范围内。"
+    },
+    {
+      "event_id": "evt_20260318_lab",
+      "patient_id": "p_demo_001",
+      "event_type": "laboratory",
+      "title": "年度体检",
+      "event_time": {
+        "start": "2026-03-18T08:42:00+08:00",
+        "end": null,
+        "precision": "minute",
+        "source": "document"
+      },
+      "institution": "示例体检中心",
+      "source_artifact_ids": ["art_lab_20260318"],
+      "facts": [
+        {
+          "fact_id": "fact_cr_20260318",
+          "kind": "observation",
+          "concept": {
+            "display": "肌酐",
+            "system": "LOINC",
+            "code": "2160-0",
+            "local_display": "肌酐",
+            "local_code": null
+          },
+          "value": {
+            "type": "quantity",
+            "number": 88,
+            "unit": "umol/L"
+          },
+          "reference_range": {
+            "low": 41,
+            "high": 81,
+            "unit": "umol/L",
+            "text": null
+          },
+          "interpretation": "high",
+          "time": {
+            "start": "2026-03-18T08:42:00+08:00",
+            "end": null,
+            "precision": "minute",
+            "source": "document"
+          },
+          "evidence": [
+            {
+              "artifact_id": "art_lab_20260318",
+              "page": 2,
+              "block_id": "b33",
+              "quote": "肌酐 88 ↑ umol/L 41-81"
+            }
+          ],
+          "confidence": 0.99,
+          "status": "confirmed",
+          "attributes": {}
+        }
+      ],
+      "summary": "肌酐轻度高于该报告参考范围，需结合既往趋势解释。"
+    },
+    {
+      "event_id": "evt_20260902_imaging",
+      "patient_id": "p_demo_001",
+      "event_type": "imaging",
+      "title": "胸部 CT",
+      "event_time": {
+        "start": "2026-09-02",
+        "end": null,
+        "precision": "day",
+        "source": "document"
+      },
+      "institution": "示例医院",
+      "source_artifact_ids": ["art_ct_20260902"],
+      "facts": [
+        {
+          "fact_id": "fact_nodule_20260902",
+          "kind": "observation",
+          "concept": {
+            "display": "右肺上叶肺结节",
+            "system": "SNOMED CT",
+            "code": null,
+            "local_display": "右肺上叶结节",
+            "local_code": null
+          },
+          "value": {
+            "type": "text",
+            "text": "约 5 mm"
+          },
+          "reference_range": null,
+          "interpretation": "abnormal",
+          "time": {
+            "start": "2026-09-02",
+            "end": null,
+            "precision": "day",
+            "source": "document"
+          },
+          "evidence": [
+            {
+              "artifact_id": "art_ct_20260902",
+              "page": 1,
+              "block_id": "b9",
+              "quote": "右肺上叶见实性结节影，直径约5 mm"
+            }
+          ],
+          "confidence": 0.96,
+          "status": "confirmed",
+          "attributes": {}
+        }
+      ],
+      "summary": "CT 报告记录右肺上叶约 5 mm 结节。"
+    }
+  ]
+}
