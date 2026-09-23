@@ -4,12 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from uuid import uuid4
 
-from ..schemas import (
-    ClinicalEvent,
-    EventTime,
-    IngestionResult,
-    SourceArtifact,
-)
+from ..schemas import ClinicalEvent, IngestionResult, OCRBlock, SourceArtifact
 
 
 @dataclass
@@ -20,7 +15,7 @@ class OCRResult:
 
 
 class OCRProvider:
-    """Adapter interface.
+    """OCR adapter boundary.
 
     Production implementations can wrap PaddleOCR, PP-Structure,
     a cloud OCR API, or another OCR engine. The canonical data model
@@ -47,8 +42,8 @@ class ClinicalNormalizer:
     """LLM normalization boundary.
 
     The normalizer receives OCR text plus layout metadata and must return
-    schema-valid ClinicalEvent objects. It should never discard the OCR
-    source and every extracted fact should carry evidence pointers.
+    schema-valid ClinicalEvent objects. It should never discard OCR source
+    data and every extracted fact should carry evidence pointers.
     """
 
     async def normalize(
@@ -85,7 +80,11 @@ async def ingest_document(
     )
 
     ocr = await ocr_provider.recognize(content, media_type)
+    artifact.ocr_engine = ocr.engine
     artifact.ocr_text = ocr.text
+    artifact.ocr_blocks = [
+        OCRBlock.model_validate(block) for block in ocr.blocks
+    ]
 
     event = await normalizer.normalize(patient_id, artifact, ocr)
 
