@@ -26,3 +26,6 @@ Thumbs.db
 data/
 uploads/
 *.sqlite3
+
+# Local OCR smoke test artifacts
+apps/api/_ocr_smoke.*

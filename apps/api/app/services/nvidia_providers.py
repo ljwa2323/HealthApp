@@ -502,8 +502,15 @@ class NvidiaClinicalNormalizer(ClinicalNormalizer):
 
 def build_default_providers() -> tuple[OCRProvider, ClinicalNormalizer]:
     api_key = get_nvidia_api_key()
-    if not api_key:
+    if api_key:
+        return NvidiaOCRProvider(api_key=api_key), NvidiaClinicalNormalizer(api_key=api_key)
+    # No cloud key: prefer local, offline OCR (zero cost, no rate limits).
+    # The LLM normalizer remains a placeholder until a local/LLM adapter lands.
+    try:
+        from .rapid_ocr_provider import RapidOCRProvider
+
+        return RapidOCRProvider(), ClinicalNormalizer()
+    except Exception:  # noqa: BLE001 - RapidOCR unavailable, keep the demo fallback.
         from .ingestion import DemoOCRProvider
 
         return DemoOCRProvider(), ClinicalNormalizer()
-    return NvidiaOCRProvider(api_key=api_key), NvidiaClinicalNormalizer(api_key=api_key)
