@@ -505,11 +505,13 @@ def build_default_providers() -> tuple[OCRProvider, ClinicalNormalizer]:
     if api_key:
         return NvidiaOCRProvider(api_key=api_key), NvidiaClinicalNormalizer(api_key=api_key)
     # No cloud key: prefer local, offline OCR (zero cost, no rate limits).
-    # The LLM normalizer remains a placeholder until a local/LLM adapter lands.
+    # Field extraction is rule-based (coordinates + dictionaries + regex);
+    # an LLM normalizer can wrap or replace it later without model changes.
     try:
+        from .field_extractor import RuleBasedNormalizer
         from .rapid_ocr_provider import RapidOCRProvider
 
-        return RapidOCRProvider(), ClinicalNormalizer()
+        return RapidOCRProvider(), RuleBasedNormalizer()
     except Exception:  # noqa: BLE001 - RapidOCR unavailable, keep the demo fallback.
         from .ingestion import DemoOCRProvider
 

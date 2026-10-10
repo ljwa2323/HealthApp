@@ -246,6 +246,9 @@ async def upload_document(
     user: UserRecord = Depends(require_patient_access),
 ):
     content = await file.read()
+    from .services.image_quality import analyze_image_quality
+
+    quality = analyze_image_quality(content)
     try:
         result = await ingest_document(
             patient_id=user.patient_id,
@@ -258,6 +261,11 @@ async def upload_document(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Ingestion failed: {exc}") from exc
 
+    result.quality = {
+        "ok": quality.ok,
+        "issues": quality.issues,
+        "metrics": quality.metrics,
+    }
     if result.extracted_event is not None:
         get_store().add_event(result.extracted_event)
     return result

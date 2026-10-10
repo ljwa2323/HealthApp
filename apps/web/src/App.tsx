@@ -8,6 +8,7 @@ import {
   changePassword,
   clearSession,
   deleteTimelineEvent,
+  ExtractedEvent,
   fetchArtifactObjectUrl,
   fetchTimeline,
   loadStoredSession,
@@ -17,6 +18,7 @@ import {
   runHealthAnalysis,
   TimelineEventApi,
   updateTimelineEvent,
+  UploadResult,
   uploadHealthRecord,
 } from "./api";
 import type { TimelineEvent } from "./types";
@@ -31,6 +33,8 @@ type UploadState = {
   status: UploadStatus;
   message: string | null;
   startedAt: number | null;
+  result: UploadResult | null;
+  qualityWarning: boolean;
 };
 
 type ChatTurn = { role: "user" | "assistant"; content: string };
@@ -48,6 +52,8 @@ const emptyUploadState: UploadState = {
   status: "idle",
   message: null,
   startedAt: null,
+  result: null,
+  qualityWarning: false,
 };
 
 const emptyAssistantState: AssistantState = {
@@ -927,6 +933,225 @@ function Timeline({
   );
 }
 
+function FactReviewPanel({
+  event,
+  ocrText,
+  review,
+  setReview,
+  editingFactId,
+  setEditingFactId,
+  editValue,
+  setEditValue,
+}: {
+  event: ExtractedEvent;
+  ocrText?: string | null;
+  review: Record<
+    string,
+    { action: "confirmed" | "corrected" | "rejected"; value?: string }
+  >;
+  setReview: React.Dispatch<
+    React.SetStateAction<
+      Record<
+        string,
+        { action: "confirmed" | "corrected" | "rejected"; value?: string }
+      >
+    >
+  >;
+  editingFactId: string | null;
+  setEditingFactId: (id: string | null) => void;
+  editValue: string;
+  setEditValue: (v: string) => void;
+}) {
+  const counts = event.facts.reduce(
+    (acc, f) => {
+      const r = review[f.fact_id];
+      if (r?.action === "confirmed") acc.confirmed += 1;
+      else if (r?.action === "corrected") acc.corrected += 1;
+      else if (r?.action === "rejected") acc.rejected += 1;
+      return acc;
+    },
+    { confirmed: 0, corrected: 0, rejected: 0 },
+  );
+
+  return (
+    <div className="fact-review">
+      <div className="fact-review-head">
+        <div>
+          <span className="eyebrow">字段提取结果</span>
+          <h3>{event.title}</h3>
+          <p className="fact-review-meta">
+            {event.summary ?? `${event.facts.length} 项检验结果`}
+            {event.event_time?.start ? ` · ${event.event_time.start}` : ""}
+            {event.institution ? ` · ${event.institution}` : ""}
+          </p>
+        </div>
+        <span className="review-badge">
+          已确认 {counts.confirmed} / 修正 {counts.corrected} / 排除{" "}
+          {counts.rejected} / 共 {event.facts.length}
+        </span>
+      </div>
+
+      <div className="fact-list">
+        {event.facts.map((fact) => {
+          const r = review[fact.fact_id];
+          const lowConf = (fact.confidence ?? 1) < 0.6;
+          const isEditing = editingFactId === fact.fact_id;
+          const cls = [
+            "fact-row",
+            r?.action === "confirmed" ? "is-confirmed" : "",
+            r?.action === "corrected" ? "is-corrected" : "",
+            r?.action === "rejected" ? "is-rejected" : "",
+            lowConf && !r ? "is-lowconf" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          const valueText =
+            fact.value.type === "quantity"
+              ? `${fact.value.number}${fact.value.unit ? ` ${fact.value.unit}` : ""}`
+              : fact.value.text;
+          const shownValue = r?.action === "corrected" && r.value ? r.value : valueText;
+          const refText = fact.reference_range?.text
+            ? fact.reference_range.text
+            : fact.reference_range &&
+                (fact.reference_range.low != null || fact.reference_range.high != null)
+              ? `${fact.reference_range.low ?? "≤"} - ${
+                  fact.reference_range.high ?? "≥"
+                }${fact.reference_range.unit ? ` ${fact.reference_range.unit}` : ""}`
+              : "—";
+
+          return (
+            <div className={cls} key={fact.fact_id}>
+              <div className="fact-name">
+                <span className="fact-display">{fact.concept.display}</span>
+                {fact.concept.local_display &&
+                  fact.concept.local_display !== fact.concept.display && (
+                    <span className="fact-local">{fact.concept.local_display}</span>
+                  )}
+              </div>
+
+              <div className="fact-value">
+                {isEditing ? (
+                  <div className="fact-edit">
+                    <input
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          setReview((prev) => ({
+                            ...prev,
+                            [fact.fact_id]: { action: "corrected", value: editValue },
+                          }));
+                          setEditingFactId(null);
+                        }
+                      }}
+                      autoFocus
+                    />
+                    <button
+                      className="mini-button"
+                      onClick={() => {
+                        setReview((prev) => ({
+                          ...prev,
+                          [fact.fact_id]: { action: "corrected", value: editValue },
+                        }));
+                        setEditingFactId(null);
+                      }}
+                    >
+                      保存
+                    </button>
+                    <button
+                      className="mini-button ghost"
+                      onClick={() => setEditingFactId(null)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <span className="fact-number">{shownValue}</span>
+                    {fact.interpretation === "high" && (
+                      <span className="flag-badge is-high">偏高</span>
+                    )}
+                    {fact.interpretation === "low" && (
+                      <span className="flag-badge is-low">偏低</span>
+                    )}
+                    {fact.interpretation === "normal" && (
+                      <span className="flag-badge is-normal">正常</span>
+                    )}
+                  </>
+                )}
+              </div>
+
+              <div className="fact-ref">
+                <span className="ref-text">参考 {refText}</span>
+                {lowConf && !r && (
+                  <span className="lowconf-tag">建议核对</span>
+                )}
+              </div>
+
+              <div className="fact-actions">
+                {r?.action === "confirmed" ? (
+                  <span className="mini-button done">已确认</span>
+                ) : r?.action === "corrected" ? (
+                  <span className="mini-button done">已修正</span>
+                ) : r?.action === "rejected" ? (
+                  <span className="mini-button done">已排除</span>
+                ) : (
+                  <>
+                    <button
+                      className="mini-button"
+                      onClick={() =>
+                        setReview((prev) => ({
+                          ...prev,
+                          [fact.fact_id]: { action: "confirmed" },
+                        }))
+                      }
+                    >
+                      确认
+                    </button>
+                    <button
+                      className="mini-button ghost"
+                      onClick={() => {
+                        const v =
+                          fact.value.type === "quantity"
+                            ? String(fact.value.number)
+                            : fact.value.text;
+                        setEditValue(v);
+                        setEditingFactId(fact.fact_id);
+                      }}
+                    >
+                      修改
+                    </button>
+                    <button
+                      className="mini-button ghost danger"
+                      onClick={() =>
+                        setReview((prev) => ({
+                          ...prev,
+                          [fact.fact_id]: { action: "rejected" },
+                        }))
+                      }
+                    >
+                      排除
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <details className="ocr-source">
+        <summary>查看 OCR 原始识别文字</summary>
+        <pre className="ocr-result-text">{ocrText ?? "（无）"}</pre>
+      </details>
+      <p className="fact-review-foot">
+        审核结果暂存在当前页面（确认/修正/排除），入库与时间轴接入是下一步。
+      </p>
+    </div>
+  );
+}
+
 function UploadPage({
   session,
   uploadState,
@@ -941,6 +1166,11 @@ function UploadPage({
   onUploaded: () => void;
 }) {
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [review, setReview] = useState<
+    Record<string, { action: "confirmed" | "corrected" | "rejected"; value?: string }>
+  >({});
+  const [editingFactId, setEditingFactId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState("");
 
   useEffect(() => {
     if (uploadState.status !== "processing" || !uploadState.startedAt) {
@@ -962,9 +1192,11 @@ function UploadPage({
       status: "processing",
       message: null,
       startedAt: Date.now(),
+      result: null,
+      qualityWarning: false,
     });
     try {
-      await uploadHealthRecord(
+      const result = await uploadHealthRecord(
         file,
         session.user.patient_id,
         session.token,
@@ -974,6 +1206,8 @@ function UploadPage({
         status: "complete",
         message: null,
         startedAt: null,
+        result,
+        qualityWarning: Boolean(result.quality && !result.quality.ok),
       });
       onUploaded();
     } catch (err) {
@@ -982,6 +1216,8 @@ function UploadPage({
         status: "offline",
         message: err instanceof Error ? err.message : "Upload failed",
         startedAt: null,
+        result: null,
+        qualityWarning: false,
       });
     }
   }
@@ -1073,20 +1309,104 @@ function UploadPage({
         </article>
 
         <article className="panel ingest-explainer">
-          <span className="eyebrow">为什么不是直接让 VL 诊断</span>
-          <h2>图像负责提供原文，模型负责整理语义</h2>
-          <p>
-            对绝大多数检验和影像报告，真正需要长期保存的是正式报告中的文字结论和结构化指标。
-            OCR 后保留原文，再用 LLM 做标准化，可以同时获得可追溯性和较好的结构化质量。
-          </p>
-          <div className="flow-list">
-            <div><span>1</span><p>保存原始图片或 PDF</p></div>
-            <div><span>2</span><p>OCR 输出文字与版面坐标</p></div>
-            <div><span>3</span><p>LLM 转成标准化 Clinical Facts</p></div>
-            <div><span>4</span><p>低置信度结果由用户确认</p></div>
-          </div>
+          <span className="eyebrow">OCR 识别结果</span>
+          <h2>
+            {status === "idle" && "上传后在此查看识别原文"}
+            {status === "processing" && "正在识别文字…"}
+            {status === "complete" && "识别完成"}
+            {status === "offline" && "识别失败"}
+          </h2>
+          {status === "idle" && (
+            <p>
+              上传报告图片或 PDF 后，这里会直接展示 OCR 识别出的文字内容，
+              方便核对识别质量。
+            </p>
+          )}
+          {status === "processing" && (
+            <p>正在调用本地 OCR 引擎识别报告文字，请稍候…</p>
+          )}
+          {status === "complete" && uploadState.result && (
+            uploadState.result.extracted_event?.facts?.length ? (
+              <FactReviewPanel
+                event={uploadState.result.extracted_event}
+                ocrText={uploadState.result.artifact.ocr_text}
+                review={review}
+                setReview={setReview}
+                editingFactId={editingFactId}
+                setEditingFactId={setEditingFactId}
+                editValue={editValue}
+                setEditValue={setEditValue}
+              />
+            ) : (
+              <div className="ocr-result">
+                <div className="ocr-meta">
+                  <span>
+                    引擎：{uploadState.result.artifact.ocr_engine ?? "—"}
+                  </span>
+                  <span>
+                    文字块：{uploadState.result.artifact.ocr_blocks?.length ?? 0}
+                  </span>
+                  <span>状态：{uploadState.result.status}</span>
+                </div>
+                <p className="no-facts-hint">
+                  未能自动识别出结构化字段，下面是原始识别文字，可先人工确认
+                </p>
+                <pre className="ocr-result-text">
+                  {uploadState.result.artifact.ocr_text || "（未识别到文字）"}
+                </pre>
+              </div>
+            )
+          )}
+          {status === "offline" && <p>{message ?? "处理失败，请重试"}</p>}
         </article>
       </div>
+
+      {uploadState.qualityWarning && uploadState.result?.quality && (
+        <div
+          className="quality-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="清晰度提示"
+        >
+          <div className="quality-modal">
+            <span className="eyebrow">识别质量提示</span>
+            <h2>清晰度过低，建议重新拍摄</h2>
+            <p>
+              这张图片{uploadState.result.quality.issues.join("、")}，可能影响识别准确率。
+            </p>
+            <ul className="quality-issues">
+              {uploadState.result.quality.issues.map((issue) => (
+                <li key={issue}>
+                  {issue === "分辨率过低"
+                    ? "图片太小，文字细节不足"
+                    : issue === "图片模糊"
+                      ? "画面发虚，文字边缘不清晰"
+                      : "画面偏暗，文字看不清"}
+                </li>
+              ))}
+            </ul>
+            <div className="quality-actions">
+              <button
+                className="primary-button"
+                onClick={() => setUploadState(emptyUploadState)}
+              >
+                重新拍摄
+              </button>
+              <button
+                className="secondary-button"
+                onClick={() =>
+                  setUploadState((prev) => ({
+                    ...prev,
+                    qualityWarning: false,
+                  }))
+                }
+              >
+                仍要上传
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

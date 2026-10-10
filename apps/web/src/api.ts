@@ -15,6 +15,62 @@ export type AuthResponse = {
   user: AuthUser;
 };
 
+export type ExtractedFact = {
+  fact_id: string;
+  kind: string;
+  concept: {
+    display: string;
+    local_display?: string | null;
+    local_code?: string | null;
+  };
+  value:
+    | { type: "quantity"; number: number; unit?: string | null }
+    | { type: "text"; text: string };
+  reference_range?: {
+    low?: number | null;
+    high?: number | null;
+    unit?: string | null;
+    text?: string | null;
+  } | null;
+  interpretation?: string | null;
+  confidence?: number | null;
+  status?: string;
+  attributes?: Record<string, unknown>;
+};
+
+export type ExtractedEvent = {
+  event_id: string;
+  event_type: string;
+  title: string;
+  event_time?: { start?: string | null; precision?: string };
+  institution?: string | null;
+  summary?: string | null;
+  facts: ExtractedFact[];
+};
+
+export type UploadResult = {
+  artifact: {
+    artifact_id: string;
+    file_name: string;
+    ocr_engine?: string | null;
+    ocr_text?: string | null;
+    ocr_blocks?: Array<{
+      block_id: string;
+      text: string;
+      confidence?: number | null;
+      bbox?: number[] | null;
+    }>;
+  };
+  status: string;
+  pipeline_steps: string[];
+  extracted_event: ExtractedEvent | null;
+  quality?: {
+    ok: boolean;
+    issues: string[];
+    metrics?: Record<string, number | string>;
+  } | null;
+};
+
 export type TimelineEventApi = {
   event_id: string;
   patient_id: string;
@@ -148,7 +204,7 @@ export async function uploadHealthRecord(
   file: File,
   patientId: string,
   token: string,
-) {
+): Promise<UploadResult> {
   const body = new FormData();
   body.append("file", file);
 

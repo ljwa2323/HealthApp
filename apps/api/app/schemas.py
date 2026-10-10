@@ -158,6 +158,7 @@ class IngestionResult(BaseModel):
     status: Literal["uploaded", "ocr_complete", "needs_review", "ready"]
     pipeline_steps: list[str]
     extracted_event: ClinicalEvent | None = None
+    quality: dict | None = None
 
 
 class AgentContext(BaseModel):

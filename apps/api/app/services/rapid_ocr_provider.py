@@ -16,12 +16,76 @@ from __future__ import annotations
 
 import asyncio
 import io
-from typing import Any
+import statistics
+from typing import Any, Callable
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 
 from ..schemas import OCRBlock
 from .ingestion import OCRProvider, OCRResult
+
+
+def _sort_reading_order(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reorder OCR blocks into natural reading order, with a self-check.
+
+    Strategy: cluster blocks into rows by y-center proximity, sort inside a
+    row by x, sort rows top to bottom. Then VERIFY the clustering: a row
+    whose vertical span far exceeds the typical block height means several
+    physical rows were merged (this happens on dense multi-column tables),
+    and sorting by x would scramble columns. If too many rows look like
+    that, the detection order was already better — keep it.
+    """
+    if len(blocks) <= 1:
+        return blocks
+    items: list[dict[str, Any]] = []
+    for block in blocks:
+        x0, y0, x1, y1 = block["bbox"]
+        items.append(
+            {
+                "block": block,
+                "cx": (x0 + x1) / 2.0,
+                "cy": (y0 + y1) / 2.0,
+                "height": y1 - y0,
+                "x0": x0,
+            }
+        )
+    items.sort(key=lambda item: item["cy"])
+    heights = [item["height"] for item in items]
+    median_h = statistics.median(heights)
+    row_gap = max(median_h * 0.5, 8.0)
+    rows: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    last_cy: float | None = None
+    for item in items:
+        if last_cy is None or abs(item["cy"] - last_cy) <= row_gap:
+            current.append(item)
+        else:
+            rows.append(current)
+            current = [item]
+        last_cy = item["cy"]
+    if current:
+        rows.append(current)
+
+    # Self-check: rows merged across physical lines have a huge vertical
+    # span relative to the typical block height. Judge by the FRACTION OF
+    # BLOCKS inside bad rows (a single merged mega-row can hold dozens of
+    # blocks while being one of many rows).
+    span_limit = 2.0 * median_h
+    bad_blocks = sum(
+        len(row)
+        for row in rows
+        if (max(i["block"]["bbox"][3] for i in row)
+            - min(i["block"]["bbox"][1] for i in row)) > span_limit
+    )
+    if rows and bad_blocks / len(blocks) > 0.15:
+        return blocks  # clustering failed; detection order was better
+
+    ordered: list[dict[str, Any]] = []
+    for row in rows:
+        row.sort(key=lambda item: item["x0"])
+        ordered.extend(item["block"] for item in row)
+    return ordered
 
 
 class RapidOCRProvider(OCRProvider):
@@ -29,7 +93,11 @@ class RapidOCRProvider(OCRProvider):
 
     engine_name = "rapidocr-ppocrv4"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        preprocess: bool = True,
+        sort_reading_order: bool = True,
+    ) -> None:
         # Deferred import: the heavy ORM/onnx modules load only when this
         # provider is actually selected.
         from rapidocr_onnxruntime import RapidOCR
@@ -38,6 +106,8 @@ class RapidOCRProvider(OCRProvider):
         # det/cls/rec_use_cuda kwargs triggers a bug in rapidocr 1.2.3's
         # param updater (KeyError: 'model_path'), so keep the constructor bare.
         self._engine = RapidOCR()
+        self.preprocess = preprocess
+        self.sort_reading_order = sort_reading_order
 
     @staticmethod
     def _prepare_image(content: bytes, media_type: str | None) -> Image.Image:
@@ -69,17 +139,24 @@ class RapidOCRProvider(OCRProvider):
         self,
         content: bytes,
         media_type: str | None,
+        preprocess_fn: Callable[[np.ndarray], np.ndarray] | None = None,
     ) -> OCRResult:
         image = self._prepare_image(content, media_type)
 
+        import cv2
         import numpy as np
 
-        array = np.array(image)
+        array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        if preprocess_fn is not None:
+            array = preprocess_fn(array)
+        elif self.preprocess:
+            from .image_preprocess import preprocess_image
+
+            array = preprocess_image(array)
         # RapidOCR is CPU-bound and synchronous; keep the event loop free.
         result, _ = await asyncio.to_thread(self._engine, array)
 
         blocks: list[dict[str, Any]] = []
-        text_lines: list[str] = []
         if result:
             for index, item in enumerate(result, start=1):
                 box, text, score = item[0], item[1], float(item[2])
@@ -94,7 +171,9 @@ class RapidOCRProvider(OCRProvider):
                         "confidence": score,
                     }
                 )
-                text_lines.append(str(text).strip())
+        if self.sort_reading_order:
+            blocks = _sort_reading_order(blocks)
+        text_lines = [block["text"] for block in blocks]
 
         return OCRResult(
             text="\n".join(text_lines).strip(),
