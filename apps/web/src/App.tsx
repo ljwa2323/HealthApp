@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import {
   AuthResponse,
@@ -17,6 +17,7 @@ import {
   registerUser,
   runHealthAnalysis,
   TimelineEventApi,
+  addTimelineEvent,
   updateTimelineEvent,
   UploadResult,
   uploadHealthRecord,
@@ -323,7 +324,9 @@ function EventCard({
         </span>
         <span className="event-copy">
           <span className="event-meta">
-            {event.displayDate} · {eventTypeLabel[event.type] ?? event.type}
+            {event.displayDate
+              ? `${event.displayDate} · ${eventTypeLabel[event.type] ?? event.type}`
+              : `时间未知 · ${eventTypeLabel[event.type] ?? event.type}`}
           </span>
           <strong>{event.title}</strong>
           <span>{event.institution}</span>
@@ -854,7 +857,7 @@ function Timeline({
   ) => Promise<void>;
 }) {
   const [filter, setFilter] = useState<Filter>("all");
-  const [expanded, setExpanded] = useState(events[0]?.id ?? "");
+  const [expanded, setExpanded] = useState("");
 
   const filtered = useMemo(
     () => events.filter((event) => filter === "all" || event.type === filter),
@@ -942,6 +945,8 @@ function FactReviewPanel({
   setEditingFactId,
   editValue,
   setEditValue,
+  extraFacts,
+  setExtraFacts,
 }: {
   event: ExtractedEvent;
   ocrText?: string | null;
@@ -961,8 +966,18 @@ function FactReviewPanel({
   setEditingFactId: (id: string | null) => void;
   editValue: string;
   setEditValue: (v: string) => void;
+  extraFacts: ExtractedFact[];
+  setExtraFacts: (f: ExtractedFact[]) => void;
 }) {
-  const counts = event.facts.reduce(
+  const allFacts = [...event.facts, ...extraFacts];
+  const [addOpen, setAddOpen] = useState(false);
+  const [addName, setAddName] = useState("");
+  const [addValue, setAddValue] = useState("");
+  const [addUnit, setAddUnit] = useState("");
+  const [addRef, setAddRef] = useState("");
+  const [addInterp, setAddInterp] = useState("");
+
+  const counts = allFacts.reduce(
     (acc, f) => {
       const r = review[f.fact_id];
       if (r?.action === "confirmed") acc.confirmed += 1;
@@ -973,6 +988,48 @@ function FactReviewPanel({
     { confirmed: 0, corrected: 0, rejected: 0 },
   );
 
+  function parseRef(text: string) {
+    const t = text.trim();
+    if (!t) return null;
+    const m = t.match(/^([\d.]+)\s*[-~–]\s*([\d.]+)\s*([\d.]+)?/);
+    if (m) {
+      return {
+        low: Number(m[1]),
+        high: Number(m[2]),
+        text: t,
+        unit: m[3] || null,
+      };
+    }
+    return { low: null, high: null, text: t, unit: null };
+  }
+
+  function handleAdd() {
+    const name = addName.trim();
+    if (!name) return;
+    const valueText = addValue.trim();
+    const num = Number(valueText);
+    const isNum = valueText !== "" && !Number.isNaN(num);
+    const fact: ExtractedFact = {
+      fact_id: `manual_${Date.now()}`,
+      kind: "observation",
+      concept: { display: name, local_display: name },
+      value: isNum
+        ? { type: "quantity", number: num, unit: addUnit.trim() || null }
+        : { type: "text", text: valueText },
+      reference_range: parseRef(addRef),
+      interpretation: addInterp || null,
+      confidence: 1,
+      status: "extracted",
+    };
+    setExtraFacts([...extraFacts, fact]);
+    setAddOpen(false);
+    setAddName("");
+    setAddValue("");
+    setAddUnit("");
+    setAddRef("");
+    setAddInterp("");
+  }
+
   return (
     <div className="fact-review">
       <div className="fact-review-head">
@@ -980,19 +1037,93 @@ function FactReviewPanel({
           <span className="eyebrow">字段提取结果</span>
           <h3>{event.title}</h3>
           <p className="fact-review-meta">
-            {event.summary ?? `${event.facts.length} 项检验结果`}
+            {event.summary ?? `${allFacts.length} 项检验结果`}
             {event.event_time?.start ? ` · ${event.event_time.start}` : ""}
             {event.institution ? ` · ${event.institution}` : ""}
           </p>
         </div>
-        <span className="review-badge">
-          已确认 {counts.confirmed} / 修正 {counts.corrected} / 排除{" "}
-          {counts.rejected} / 共 {event.facts.length}
-        </span>
+        <div className="fact-review-badges">
+          <span className="review-badge">
+            已确认 {counts.confirmed} / 修正 {counts.corrected} / 排除{" "}
+            {counts.rejected} / 共 {allFacts.length}
+          </span>
+          <button
+            className="mini-button add-fact-btn"
+            onClick={() => setAddOpen((v) => !v)}
+          >
+            {addOpen ? "收起" : "+ 手动添加一条"}
+          </button>
+        </div>
       </div>
 
+      {addOpen && (
+        <div className="add-fact-form">
+          <div className="add-fact-grid">
+            <label className="add-fact-field">
+              <span>项目名称 *</span>
+              <input
+                value={addName}
+                onChange={(e) => setAddName(e.target.value)}
+                placeholder="如：血尿酸"
+              />
+            </label>
+            <label className="add-fact-field">
+              <span>数值 / 结果 *</span>
+              <input
+                value={addValue}
+                onChange={(e) => setAddValue(e.target.value)}
+                placeholder="如：360 或 阴性"
+              />
+            </label>
+            <label className="add-fact-field">
+              <span>单位（选填）</span>
+              <input
+                value={addUnit}
+                onChange={(e) => setAddUnit(e.target.value)}
+                placeholder="如：umol/L"
+              />
+            </label>
+            <label className="add-fact-field">
+              <span>参考范围（选填）</span>
+              <input
+                value={addRef}
+                onChange={(e) => setAddRef(e.target.value)}
+                placeholder="如：155-422"
+              />
+            </label>
+            <label className="add-fact-field">
+              <span>判定（选填）</span>
+              <select
+                value={addInterp}
+                onChange={(e) => setAddInterp(e.target.value)}
+              >
+                <option value="">未知</option>
+                <option value="normal">正常</option>
+                <option value="high">偏高</option>
+                <option value="low">偏低</option>
+              </select>
+            </label>
+          </div>
+          <div className="add-fact-actions">
+            <button
+              className="mini-button"
+              disabled={!addName.trim()}
+              onClick={handleAdd}
+            >
+              添加
+            </button>
+            <button
+              className="mini-button ghost"
+              onClick={() => setAddOpen(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="fact-list">
-        {event.facts.map((fact) => {
+        {allFacts.map((fact) => {
           const r = review[fact.fact_id];
           const lowConf = (fact.confidence ?? 1) < 0.6;
           const isEditing = editingFactId === fact.fact_id;
@@ -1171,6 +1302,12 @@ function UploadPage({
   >({});
   const [editingFactId, setEditingFactId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  const [extraFacts, setExtraFacts] = useState<ExtractedFact[]>([]);
+  const [retryOpen, setRetryOpen] = useState(false);
+  const [added, setAdded] = useState(false);
+  const [addError, setAddError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const lastFileRef = useRef<File | null>(null);
 
   useEffect(() => {
     if (uploadState.status !== "processing" || !uploadState.startedAt) {
@@ -1187,6 +1324,11 @@ function UploadPage({
   }, [uploadState.status, uploadState.startedAt]);
 
   async function handleFile(file: File) {
+    lastFileRef.current = file;
+    setExtraFacts([]);
+    setReview({});
+    setAdded(false);
+    setAddError("");
     setUploadState({
       fileName: file.name,
       status: "processing",
@@ -1231,6 +1373,48 @@ function UploadPage({
         ? 0
         : Math.min(92, Math.round(100 * (1 - Math.exp(-elapsedSec / 55))));
 
+  async function handleAddToTimeline() {
+    const ev = uploadState.result?.extracted_event;
+    if (!ev) return;
+    setAddError("");
+    const facts: ExtractedFact[] = [];
+    for (const f of ev.facts) {
+      const r = review[f.fact_id];
+      if (r?.action === "rejected") continue;
+      let fact: ExtractedFact = { ...f, time: { precision: "unknown" } };
+      if (r?.action === "corrected" && r.value) {
+        const trimmed = r.value.trim();
+        const m = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*(.*)$/);
+        fact = {
+          ...fact,
+          value: m
+            ? { type: "quantity", number: Number(m[1]), unit: m[2] || null }
+            : { type: "text", text: trimmed },
+          status: "corrected",
+        };
+      } else if (r?.action === "confirmed") {
+        fact = { ...fact, status: "confirmed" };
+      }
+      facts.push(fact);
+    }
+    for (const f of extraFacts) {
+      facts.push({ ...f, time: { precision: "unknown" } });
+    }
+    const payload: ExtractedEvent = {
+      ...ev,
+      patient_id: session.user.patient_id,
+      source_artifact_ids: [uploadState.result!.artifact.artifact_id],
+      facts,
+    };
+    try {
+      await addTimelineEvent(session.user.patient_id, session.token, payload);
+      setAdded(true);
+      onUploaded();
+    } catch (err) {
+      setAddError(err instanceof Error ? err.message : "加入时间轴失败");
+    }
+  }
+
   return (
     <section className="page-stack">
       <div className="section-title">
@@ -1245,6 +1429,7 @@ function UploadPage({
         <article className="upload-card">
           <label className="drop-zone">
             <input
+              ref={fileInputRef}
               type="file"
               accept="image/*,.pdf"
               onChange={(event) => {
@@ -1295,13 +1480,35 @@ function UploadPage({
                     </strong>
                     <span>
                       {status === "complete"
-                        ? "已写入时间轴，可在「时间轴」中确认或修正"
+                        ? added
+                          ? "已加入时间轴，可在「时间轴」中查看"
+                          : "提取完成，审核后可点击「加入时间轴」"
                         : (message ?? "请检查 API 与登录状态")}
                     </span>
                   </div>
-                  <span className="processing-badge">
-                    {status === "complete" ? "DONE" : "ERROR"}
-                  </span>
+                  {status === "complete" ? (
+                    <div className="retry-actions">
+                      <button
+                        className="primary-button add-timeline-btn"
+                        onClick={() => void handleAddToTimeline()}
+                        disabled={added}
+                      >
+                        {added ? "已加入时间轴 ✓" : "加入时间轴"}
+                      </button>
+                      <button
+                        className="mini-button"
+                        onClick={() => setRetryOpen(true)}
+                      >
+                        重新识别
+                      </button>
+                      <span className="processing-badge">DONE</span>
+                    </div>
+                  ) : (
+                    <span className="processing-badge">ERROR</span>
+                  )}
+                  {status === "complete" && addError && (
+                    <p className="add-error">{addError}</p>
+                  )}
                 </div>
               )}
             </div>
@@ -1336,6 +1543,8 @@ function UploadPage({
                 setEditingFactId={setEditingFactId}
                 editValue={editValue}
                 setEditValue={setEditValue}
+                extraFacts={extraFacts}
+                setExtraFacts={setExtraFacts}
               />
             ) : (
               <div className="ocr-result">
@@ -1402,6 +1611,51 @@ function UploadPage({
                 }
               >
                 仍要上传
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {retryOpen && (
+        <div
+          className="quality-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="重新识别"
+        >
+          <div className="quality-modal">
+            <span className="eyebrow">重新识别</span>
+            <h2>清晰图片更有助于识别</h2>
+            <p>
+              当前结果可能不够准确。你可以重新选择一张更清晰的照片，或对同一张图再次识别。
+            </p>
+            <div className="quality-actions">
+              <button
+                className="primary-button"
+                onClick={() => {
+                  setRetryOpen(false);
+                  fileInputRef.current?.click();
+                }}
+              >
+                重新选择图片
+              </button>
+              <button
+                className="secondary-button"
+                onClick={() => {
+                  setRetryOpen(false);
+                  if (lastFileRef.current) {
+                    void handleFile(lastFileRef.current);
+                  }
+                }}
+              >
+                重新识别这张图
+              </button>
+              <button
+                className="mini-button ghost"
+                onClick={() => setRetryOpen(false)}
+              >
+                取消
               </button>
             </div>
           </div>

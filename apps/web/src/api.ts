@@ -36,6 +36,7 @@ export type ExtractedFact = {
   confidence?: number | null;
   status?: string;
   attributes?: Record<string, unknown>;
+  time?: { start?: string | null; precision?: string };
 };
 
 export type ExtractedEvent = {
@@ -46,6 +47,8 @@ export type ExtractedEvent = {
   institution?: string | null;
   summary?: string | null;
   facts: ExtractedFact[];
+  patient_id?: string;
+  source_artifact_ids?: string[];
 };
 
 export type UploadResult = {
@@ -234,6 +237,23 @@ export async function fetchTimeline(
   );
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as TimelineEventApi[];
+}
+
+export async function addTimelineEvent(
+  patientId: string,
+  token: string,
+  event: ExtractedEvent,
+): Promise<TimelineEventApi> {
+  const response = await fetch(
+    `${API_BASE}/api/patients/${patientId}/timeline`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return (await response.json()) as TimelineEventApi;
 }
 
 export async function updateTimelineEvent(

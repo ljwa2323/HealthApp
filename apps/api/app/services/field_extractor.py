@@ -160,6 +160,32 @@ DATE_RE = re.compile(
     r"(?:20\d{2}\s*[年./-]\s*\d{1,2}\s*[月./-]\s*\d{1,2}\s*日?)"
     r"|(?:\d{1,2}\s*月\s*\d{1,2}\s*日)"
 )
+DATE_KEYWORDS = (
+    "检验日期", "送检时间", "采样时间", "标本采集时间", "采集时间",
+    "检验时间", "检查日期", "检查时间", "报告日期",
+)
+
+
+def _find_document_date(
+    blocks: list[dict[str, Any]],
+    text: str,
+) -> re.Match[str] | None:
+    """Locate the report (examination) date.
+
+    Date lines carrying a date keyword (检验日期/送检时间/采样时间/…) are
+    authoritative; only when none is found fall back to the first date-like
+    token anywhere in the OCR text.
+    """
+    for block in blocks:
+        t = block.get("text") or ""
+        if not t:
+            continue
+        for kw in DATE_KEYWORDS:
+            if kw in t:
+                m = DATE_RE.search(t)
+                if m:
+                    return m
+    return DATE_RE.search(text or "")
 HDR_WORDS = {
     "项目", "名称", "结果", "参考", "单位", "范围", "检测方法", "方法", "测定结果",
 }
@@ -581,8 +607,9 @@ def extract_event(
     if not facts:
         return None
 
-    # Document date: prefer an explicit date string in the raw OCR text.
-    m = DATE_RE.search(ocr.text or "")
+    # Document date: prefer a line carrying a date keyword (检验日期/送检
+    # 时间/采样时间…), else the first date-like token in the raw OCR text.
+    m = _find_document_date(blocks, ocr.text or "")
     event_time: EventTime
     if m:
         raw = m.group(0).replace("年", "-").replace("月", "-").replace("日", "").replace("/", "-").replace(".", "-")

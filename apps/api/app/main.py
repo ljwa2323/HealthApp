@@ -266,8 +266,9 @@ async def upload_document(
         "issues": quality.issues,
         "metrics": quality.metrics,
     }
-    if result.extracted_event is not None:
-        get_store().add_event(result.extracted_event)
+    # The event is NOT written to the timeline here: the patient reviews the
+    # extracted fields first and explicitly adds the event via
+    # POST /api/patients/{patient_id}/timeline.
     return result
 
 
