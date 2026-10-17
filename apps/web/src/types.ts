@@ -4,7 +4,10 @@ export type EventKind =
   | "visit"
   | "medication"
   | "procedure"
-  | "vital";
+  | "vital"
+  | "hospitalization"
+  | "symptom"
+  | "other";
 
 export type Fact = {
   id: string;
@@ -12,6 +15,7 @@ export type Fact = {
   value: string;
   interpretation?: "normal" | "high" | "low" | "abnormal";
   evidence: string;
+  attributes?: Record<string, unknown>;
 };
 
 export type TimelineEvent = {

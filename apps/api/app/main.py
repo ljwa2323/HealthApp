@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .auth import get_current_user, require_patient_access
-from .config import get_nvidia_api_key
+from .config import get_deepseek_api_key, get_glm_api_key, get_nvidia_api_key
 from .schemas import (
     AuthResponse,
     AuthUser,
@@ -63,11 +63,14 @@ def _to_auth_user(user: UserRecord) -> AuthUser:
 @app.on_event("startup")
 def startup_banner() -> None:
     get_store()
-    key = get_nvidia_api_key()
-    if key:
+    if get_nvidia_api_key():
         print("NVIDIA providers enabled (OCR + LLM).")
+    elif get_glm_api_key():
+        print("GLM vision normalizer enabled (RapidOCR + GLM vision).")
+    elif get_deepseek_api_key():
+        print("DeepSeek normalizer enabled (RapidOCR + DeepSeek LLM).")
     else:
-        print("NVIDIA_API_KEY missing; falling back to demo OCR/normalizer.")
+        print("No cloud key: rule-based extraction enabled.")
     print("User registration auth enabled.")
 
 
@@ -248,6 +251,10 @@ async def upload_document(
     content = await file.read()
     from .services.image_quality import analyze_image_quality
 
+    # First pass: cheap heuristic split (text vs imaging) so bad photos
+    # are flagged before OCR. After ingestion the classifier knows the
+    # real document type; if it differs from the heuristic, re-run the
+    # gate with the authoritative type so issues match the document.
     quality = analyze_image_quality(content)
     try:
         result = await ingest_document(
@@ -255,16 +262,31 @@ async def upload_document(
             file_name=file.filename or "upload",
             media_type=file.content_type,
             content=content,
+            # Heuristic split from the quality gate: an "imaging" verdict
+            # short-circuits OCR (pure film shot, nothing to read).
+            doc_type_hint=quality.doc_type,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Ingestion failed: {exc}") from exc
 
+    # Map the classified event type onto the quality-gate branches.
+    # Only an explicit "imaging" classification switches the gate to the
+    # imaging checks. Any other outcome (laboratory, unclassified, or a
+    # mis-classified film photo) keeps the heuristic split — overwriting
+    # an auto-"imaging" verdict with the text checks would re-introduce
+    # false "too dark" warnings for dark film photos.
+    classified_type = (result.artifact.document_type or "").lower()
+    expected = "imaging" if classified_type == "imaging" else quality.doc_type
+    if quality.doc_type != expected:
+        quality = analyze_image_quality(content, doc_type=expected)
+
     result.quality = {
         "ok": quality.ok,
         "issues": quality.issues,
         "metrics": quality.metrics,
+        "doc_type": quality.doc_type,
     }
     # The event is NOT written to the timeline here: the patient reviews the
     # extracted fields first and explicitly adds the event via

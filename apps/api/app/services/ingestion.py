@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from uuid import uuid4
 
-from ..schemas import ClinicalEvent, IngestionResult, OCRBlock, SourceArtifact
+from ..schemas import (
+    ClinicalEvent,
+    EventTime,
+    IngestionResult,
+    OCRBlock,
+    SourceArtifact,
+)
 
 
 @dataclass
@@ -63,6 +70,7 @@ async def ingest_document(
     content: bytes,
     ocr_provider: OCRProvider | None = None,
     normalizer: ClinicalNormalizer | None = None,
+    doc_type_hint: str | None = None,
 ) -> IngestionResult:
     if ocr_provider is None or normalizer is None:
         from .nvidia_providers import build_default_providers
@@ -93,6 +101,35 @@ async def ingest_document(
         storage_uri=saved.storage_path,
     )
 
+    # Pure-image path: the quality gate classified this as a film/imaging
+    # shot (dark background, no report text to read). Save the original as
+    # evidence and emit an imaging event with no facts instead of running
+    # OCR — OCR on a film photo risks mis-classified "laboratory" garbage
+    # and buys nothing when there is no text.
+    if doc_type_hint == "imaging":
+        artifact.document_type = "imaging"
+        event = ClinicalEvent(
+            event_id=f"evt_{uuid4().hex[:10]}",
+            patient_id=patient_id,
+            event_type="imaging",
+            title=Path(file_name).stem or "影像记录",
+            event_time=EventTime(precision="unknown", source="document"),
+            source_artifact_ids=[artifact.artifact_id],
+            facts=[],
+            summary="纯影像原图，未识别到文字",
+        )
+        return IngestionResult(
+            artifact=artifact,
+            status="needs_review",
+            pipeline_steps=[
+                "upload_complete",
+                "sha256_dedup_key_created",
+                "source_file_saved",
+                "imaging_no_ocr",
+            ],
+            extracted_event=event,
+        )
+
     ocr = await ocr_provider.recognize(content, media_type)
     artifact.ocr_engine = ocr.engine
     artifact.ocr_text = ocr.text
@@ -100,7 +137,21 @@ async def ingest_document(
         OCRBlock.model_validate(block) for block in ocr.blocks
     ]
 
-    event = await normalizer.normalize(patient_id, artifact, ocr)
+    # Vision normalizers read the raw image directly (bypass OCR text);
+    # text normalizers consume the OCR result.
+    if hasattr(normalizer, "normalize_image"):
+        event = await normalizer.normalize_image(patient_id, artifact, content)
+    else:
+        event = await normalizer.normalize(patient_id, artifact, ocr)
+
+    # OCR x AI cross-check: compare the AI-extracted facts against the raw
+    # OCR text so the user sees which items the two readings agree on and
+    # which ones need manual verification.
+    from .cross_check import cross_check_facts
+
+    cross_check: list[dict] = []
+    if event is not None and event.facts:
+        cross_check = cross_check_facts(ocr.text, event.facts)
 
     steps = [
         "upload_complete",
@@ -135,4 +186,5 @@ async def ingest_document(
         status=status,  # type: ignore[arg-type]
         pipeline_steps=steps,
         extracted_event=event,
+        cross_check=cross_check,
     )

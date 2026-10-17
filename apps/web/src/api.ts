@@ -43,9 +43,15 @@ export type ExtractedEvent = {
   event_id: string;
   event_type: string;
   title: string;
-  event_time?: { start?: string | null; precision?: string };
+  event_time?: {
+    start?: string | null;
+    end?: string | null;
+    precision?: string;
+    source?: string;
+  };
   institution?: string | null;
   summary?: string | null;
+  narrative?: string | null;
   facts: ExtractedFact[];
   patient_id?: string;
   source_artifact_ids?: string[];
@@ -55,6 +61,7 @@ export type UploadResult = {
   artifact: {
     artifact_id: string;
     file_name: string;
+    document_type?: string | null;
     ocr_engine?: string | null;
     ocr_text?: string | null;
     ocr_blocks?: Array<{
@@ -67,10 +74,17 @@ export type UploadResult = {
   status: string;
   pipeline_steps: string[];
   extracted_event: ExtractedEvent | null;
+  cross_check?: Array<{
+    fact_id: string;
+    concept: string;
+    status: "verified" | "not_found" | "conflict";
+    detail: string;
+  }>;
   quality?: {
     ok: boolean;
     issues: string[];
     metrics?: Record<string, number | string>;
+    doc_type?: "auto" | "text" | "imaging" | null;
   } | null;
 };
 
@@ -89,6 +103,7 @@ export type TimelineEventApi = {
     value?: { type: string; number?: number; unit?: string; text?: string } | null;
     interpretation?: "low" | "normal" | "high" | "abnormal" | "unknown" | null;
     evidence?: Array<{ quote?: string | null; artifact_id?: string | null }>;
+    attributes?: Record<string, unknown>;
   }>;
 };
 

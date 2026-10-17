@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { DragEvent } from "react";
 import Markdown from "react-markdown";
 import {
   AuthResponse,
@@ -9,6 +10,7 @@ import {
   clearSession,
   deleteTimelineEvent,
   ExtractedEvent,
+  ExtractedFact,
   fetchArtifactObjectUrl,
   fetchTimeline,
   loadStoredSession,
@@ -77,15 +79,157 @@ const eventTypeLabel: Record<string, string> = {
   other: "其他",
 };
 
+// Per-document-type extra fields (backend fills fact.attributes with these
+// keys). Rendered as small chips under each fact row.
+const ATTR_LABELS: Record<string, string> = {
+  dose: "剂量",
+  frequency: "频次",
+  route: "用法",
+  quantity: "数量",
+  body_part: "部位",
+  conclusion: "结论",
+  department: "科室",
+  chief_complaint: "主诉",
+  admission_date: "入院日期",
+  discharge_date: "出院日期",
+  anesthesia: "麻醉方式",
+  surgeon: "术者",
+  pre_diagnosis: "术前诊断",
+  post_diagnosis: "术后诊断",
+  duration: "持续时间",
+  detail: "备注",
+};
+
+// Which attribute keys are shown for each document type (fallback: all).
+const EVENT_ATTR_KEYS: Record<string, string[]> = {
+  medication: ["dose", "frequency", "route", "quantity", "detail"],
+  imaging: ["body_part", "conclusion", "detail"],
+  visit: ["department", "chief_complaint", "detail"],
+  hospitalization: ["department", "admission_date", "discharge_date", "detail"],
+  procedure: ["anesthesia", "surgeon", "pre_diagnosis", "post_diagnosis", "detail"],
+  symptom: ["duration", "detail"],
+  laboratory: [],
+  vital: [],
+  other: [],
+};
+
+function factAttrChips(
+  eventType: string | undefined,
+  attrs: Record<string, unknown> | undefined,
+): Array<{ label: string; value: string }> {
+  if (!attrs) return [];
+  const keys =
+    EVENT_ATTR_KEYS[eventType ?? ""] ??
+    Object.keys(attrs).filter((k) => k !== "detail");
+  const chips: Array<{ label: string; value: string }> = [];
+  for (const key of keys) {
+    const val = attrs[key];
+    if (val == null || String(val) === "") continue;
+    chips.push({
+      label: ATTR_LABELS[key] ?? key,
+      value: String(val),
+    });
+  }
+  return chips;
+}
+
+// Quality-warning modal copy, split by the backend's quality branch
+// ("text" = white-background reports, "imaging" = film photo shots).
+const QUALITY_ISSUE_TEXT: Record<string, Record<string, string>> = {
+  text: {
+    分辨率过低: "图片太小，文字细节不足",
+    图片模糊: "画面发虚，文字边缘不清晰",
+    光线太暗: "画面偏暗，文字看不清",
+  },
+  imaging: {
+    分辨率过低: "影像分辨率不足，细节可能缺失",
+    画面模糊: "影像发虚，结构边缘不清晰",
+    画面过暗: "影像整体过暗，结构难以辨认",
+    画面过曝: "画面过曝或有反光，细节被白光淹没",
+  },
+};
+
+function qualityModalTitle(docType?: string | null): string {
+  return docType === "imaging"
+    ? "影像清晰度不足，建议重新拍摄"
+    : "清晰度过低，建议重新拍摄";
+}
+
+function qualityImpactCopy(docType?: string | null): string {
+  return docType === "imaging"
+    ? "可能影响后续判读准确率"
+    : "可能影响识别准确率";
+}
+
+function qualityIssueText(issue: string, docType?: string | null): string {
+  return QUALITY_ISSUE_TEXT[docType ?? ""]?.[issue] ?? issue;
+}
+
+type UploadQuality = NonNullable<UploadResult["quality"]>;
+
+// Shared quality-warning modal for both branches: "text" (documents) and
+// "imaging" (film photos). Only warns — the user can still keep the photo.
+function QualityWarningModal({
+  quality,
+  onRetake,
+  onKeep,
+}: {
+  quality: UploadQuality;
+  onRetake: () => void;
+  onKeep: () => void;
+}) {
+  return (
+    <div
+      className="quality-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label="清晰度提示"
+    >
+      <div className="quality-modal">
+        <span className="eyebrow">识别质量提示</span>
+        <h2>{qualityModalTitle(quality.doc_type)}</h2>
+        <p>
+          这张图片{quality.issues.join("、")}，{qualityImpactCopy(quality.doc_type)}。
+        </p>
+        <ul className="quality-issues">
+          {quality.issues.map((issue) => (
+            <li key={issue}>{qualityIssueText(issue, quality.doc_type)}</li>
+          ))}
+        </ul>
+        <div className="quality-actions">
+          <button className="primary-button" type="button" onClick={onRetake}>
+            重新拍摄
+          </button>
+          <button className="secondary-button" type="button" onClick={onKeep}>
+            仍要上传
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Normalize a date string into a YYYY-MM-DD sort key ("" when absent). */
+function dateSortKey(value: string): string {
+  const v = String(value ?? "").trim();
+  if (!v) return "";
+  const m = v.match(/^(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})/);
+  if (m) {
+    return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  }
+  return v.slice(0, 10);
+}
+
 function mapApiEvent(event: TimelineEventApi): TimelineEvent {
   const start = event.event_time?.start ?? "";
   const displayDate = String(start).slice(0, 10);
   const mappedType = (
-    ["laboratory", "imaging", "visit", "medication", "procedure", "vital"].includes(
-      event.event_type,
-    )
+    [
+      "laboratory", "imaging", "visit", "medication", "procedure", "vital",
+      "hospitalization", "symptom", "other",
+    ].includes(event.event_type)
       ? event.event_type
-      : "visit"
+      : "other"
   ) as TimelineEvent["type"];
 
   return {
@@ -121,6 +265,7 @@ function mapApiEvent(event: TimelineEventApi): TimelineEvent {
             ? fact.interpretation
             : undefined,
         evidence: fact.evidence?.[0]?.quote ?? "",
+        attributes: fact.attributes,
       };
     }),
   };
@@ -331,7 +476,20 @@ function EventCard({
           <strong>{event.title}</strong>
           <span>{event.institution}</span>
         </span>
-        <span className="event-toggle">{expanded ? "收起" : "查看"}</span>
+        <span className="event-head-actions">
+          <span className="event-toggle">{expanded ? "收起" : "查看"}</span>
+          <span
+            className="event-delete"
+            onClick={(clickEvent) => {
+              // The head row is one button; stop the click from also
+              // toggling the card open.
+              clickEvent.stopPropagation();
+              onDelete(event);
+            }}
+          >
+            删除记录
+          </span>
+        </span>
       </button>
 
       <p className="event-summary">{event.summary}</p>
@@ -346,6 +504,15 @@ function EventCard({
                     <div>
                       <span className="fact-label">{fact.label}</span>
                       <strong>{fact.value}</strong>
+                      {factAttrChips(event.type, fact.attributes).length > 0 && (
+                        <span className="fact-attrs">
+                          {factAttrChips(event.type, fact.attributes).map((chip) => (
+                            <span className="attr-chip" key={chip.label}>
+                              {chip.label}：{chip.value}
+                            </span>
+                          ))}
+                        </span>
+                      )}
                     </div>
                     <StatusPill value={fact.interpretation} />
                     <p className="evidence-copy">{fact.evidence}</p>
@@ -361,13 +528,6 @@ function EventCard({
               <div className="event-actions">
                 <button type="button" className="secondary-button" onClick={startEdit}>
                   修正提取结果
-                </button>
-                <button
-                  type="button"
-                  className="danger-button"
-                  onClick={() => onDelete(event)}
-                >
-                  删除记录
                 </button>
               </div>
             </>
@@ -859,10 +1019,21 @@ function Timeline({
   const [filter, setFilter] = useState<Filter>("all");
   const [expanded, setExpanded] = useState("");
 
-  const filtered = useMemo(
-    () => events.filter((event) => filter === "all" || event.type === filter),
-    [events, filter],
-  );
+  const filtered = useMemo(() => {
+    const list = events.filter(
+      (event) => filter === "all" || event.type === filter,
+    );
+    // Sort by the document date, newest at the top (further down = older).
+    // Events without a date go to the bottom.
+    return [...list].sort((a, b) => {
+      const da = dateSortKey(a.date);
+      const db = dateSortKey(b.date);
+      if (!da && !db) return 0;
+      if (!da) return 1;
+      if (!db) return -1;
+      return db.localeCompare(da);
+    });
+  }, [events, filter]);
 
   const filters: Array<{ key: Filter; label: string }> = [
     { key: "all", label: "全部" },
@@ -907,17 +1078,20 @@ function Timeline({
         </article>
       ) : (
         <div className="timeline-shell">
-          <aside className="year-rail">
-            <strong>时间</strong>
-            <span />
-            <strong>轴</strong>
-          </aside>
           <div className="timeline-list">
             {filtered.map((event) => (
-              <EventCard
+              <div
                 key={event.id}
-                event={event}
-                expanded={expanded === event.id}
+                className="timeline-item"
+                data-type={event.type}
+              >
+                <span className="timeline-date">
+                  {event.displayDate || "日期未填"}
+                </span>
+                <span className="timeline-dot" aria-hidden="true" />
+                <EventCard
+                  event={event}
+                  expanded={expanded === event.id}
                 onToggle={() =>
                   setExpanded((current) =>
                     current === event.id ? "" : event.id,
@@ -928,6 +1102,7 @@ function Timeline({
                 onDelete={onDelete}
                 onSaveEdit={onSaveEdit}
               />
+              </div>
             ))}
           </div>
         </div>
@@ -936,9 +1111,17 @@ function Timeline({
   );
 }
 
+type CustomField = {
+  id: string;
+  name: string;
+  type: "input" | "select";
+  options: string[];
+};
+
 function FactReviewPanel({
   event,
   ocrText,
+  crossCheck,
   review,
   setReview,
   editingFactId,
@@ -950,6 +1133,12 @@ function FactReviewPanel({
 }: {
   event: ExtractedEvent;
   ocrText?: string | null;
+  crossCheck?: Array<{
+    fact_id: string;
+    concept: string;
+    status: "verified" | "not_found" | "conflict";
+    detail: string;
+  }>;
   review: Record<
     string,
     { action: "confirmed" | "corrected" | "rejected"; value?: string }
@@ -976,6 +1165,14 @@ function FactReviewPanel({
   const [addUnit, setAddUnit] = useState("");
   const [addRef, setAddRef] = useState("");
   const [addInterp, setAddInterp] = useState("");
+  // Custom structure: user designs the record's fields (name + input/select),
+  // then the add form renders from it and every field becomes one fact.
+  const [customOpen, setCustomOpen] = useState(false);
+  const [structDraft, setStructDraft] = useState<CustomField[]>([]);
+  const [structNameDraft, setStructNameDraft] = useState("");
+  const [structure, setStructure] = useState<CustomField[]>([]);
+  const [recordName, setRecordName] = useState("");
+  const [formValues, setFormValues] = useState<Record<string, string>>({});
 
   const counts = allFacts.reduce(
     (acc, f) => {
@@ -1003,7 +1200,96 @@ function FactReviewPanel({
     return { low: null, high: null, text: t, unit: null };
   }
 
+  function factValueText(fact: ExtractedFact): string {
+    const v = fact.value;
+    if (!v) return "";
+    if (v.type === "quantity") {
+      return v.unit ? `${v.number} ${v.unit}` : String(v.number);
+    }
+    return v.text;
+  }
+
+  function openStructEditor() {
+    if (structure.length) {
+      setStructDraft(structure.map((f) => ({ ...f, options: [...f.options] })));
+    } else {
+      // Start with several blank rows so multi-field records (e.g. four
+      // temperature readings a day) can be designed without adding rows.
+      const now = Date.now();
+      setStructDraft(
+        Array.from({ length: 4 }, (_, i) => ({
+          id: `f_${now}_${i}`,
+          name: "",
+          type: "input",
+          options: [],
+        })),
+      );
+    }
+    setStructNameDraft(recordName);
+    setCustomOpen(true);
+  }
+
+  function applyStructure() {
+    const valid = structDraft
+      .map((f) => ({ ...f, name: f.name.trim() }))
+      .filter((f) => f.name !== "");
+    if (!valid.length) return;
+    setStructure(valid);
+    setRecordName(structNameDraft.trim() || "自定义记录");
+    // Never auto-fill on apply; the user decides with the "自动填入" button.
+    setFormValues({});
+    setCustomOpen(false);
+    setAddOpen(true);
+  }
+
+  function autoFillValues() {
+    setFormValues((current) => {
+      const next: Record<string, string> = { ...current };
+      for (const f of structure) {
+        if (next[f.id]) continue; // keep what the user already typed
+        const hit = allFacts.find((x) => x.concept.display === f.name);
+        if (hit) next[f.id] = factValueText(hit);
+      }
+      return next;
+    });
+  }
+
   function handleAdd() {
+    if (structure.length > 0) {
+      // A custom structure describes ONE record: all designed fields belong
+      // to this single entry. Merge the filled values into one fact instead
+      // of creating one fact per field.
+      const parts: string[] = [];
+      const attrs: Record<string, unknown> = {};
+      for (const f of structure) {
+        const raw = (formValues[f.id] ?? "").trim();
+        if (!raw) continue;
+        parts.push(`${f.name}：${raw}`);
+        attrs[f.name] = raw;
+      }
+      if (!parts.length) return;
+      setExtraFacts([
+        ...extraFacts,
+        {
+          fact_id: `manual_${Date.now()}`,
+          kind: "observation",
+          concept: {
+            display: recordName.trim() || "自定义记录",
+            local_display: recordName.trim() || "自定义记录",
+          },
+          value: { type: "text", text: parts.join(" / ") },
+          reference_range: null,
+          interpretation: null,
+          confidence: 1,
+          status: "extracted",
+          attributes: attrs,
+        },
+      ]);
+      setAddOpen(false);
+      setFormValues({});
+      return;
+    }
+
     const name = addName.trim();
     if (!name) return;
     const valueText = addValue.trim();
@@ -1053,61 +1339,229 @@ function FactReviewPanel({
           >
             {addOpen ? "收起" : "+ 手动添加一条"}
           </button>
+          <button
+            className="mini-button struct-btn"
+            onClick={openStructEditor}
+          >
+            {structure.length ? `调整结构（${structure.length} 项）` : "自定义结构"}
+          </button>
         </div>
       </div>
+
+      {customOpen && (
+        <div className="struct-editor">
+          <div className="struct-editor-head">
+            <span className="eyebrow">自定义结构</span>
+            <span className="struct-hint">
+              一条记录一个结构：字段就是这一条记录要包含的数据项；确定后按此录入，可用"自动填入"放入已识别数据
+            </span>
+          </div>
+          <label className="struct-name-field">
+            <span>记录名称</span>
+            <input
+              value={structNameDraft}
+              onChange={(e) => setStructNameDraft(e.target.value)}
+              placeholder="如：体温记录"
+            />
+          </label>
+          {structDraft.map((f, index) => (
+            <div className="struct-row" key={f.id}>
+              <input
+                className="struct-name"
+                value={f.name}
+                onChange={(e) =>
+                  setStructDraft((d) =>
+                    d.map((x, i) =>
+                      i === index ? { ...x, name: e.target.value } : x,
+                    ),
+                  )
+                }
+                placeholder="字段名称，如：体温"
+              />
+              <select
+                className="struct-type"
+                value={f.type}
+                onChange={(e) =>
+                  setStructDraft((d) =>
+                    d.map((x, i) =>
+                      i === index
+                        ? { ...x, type: e.target.value as CustomField["type"] }
+                        : x,
+                    ),
+                  )
+                }
+              >
+                <option value="input">填写</option>
+                <option value="select">选择</option>
+              </select>
+              {f.type === "select" && (
+                <input
+                  className="struct-options"
+                  value={f.options.join("，")}
+                  onChange={(e) =>
+                    setStructDraft((d) =>
+                      d.map((x, i) =>
+                        i === index
+                          ? {
+                              ...x,
+                              options: e.target.value
+                                .split(/[,，]/)
+                                .map((s) => s.trim())
+                                .filter(Boolean),
+                            }
+                          : x,
+                      ),
+                    )
+                  }
+                  placeholder="选项，逗号分隔，如：正常，偏高，偏低"
+                />
+              )}
+              <button
+                className="mini-button ghost"
+                onClick={() =>
+                  setStructDraft((d) => d.filter((_, i) => i !== index))
+                }
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <div className="struct-actions">
+            <button
+              className="mini-button"
+              onClick={() =>
+                setStructDraft((d) => [
+                  ...d,
+                  {
+                    id: `f_${Date.now()}_${d.length}`,
+                    name: "",
+                    type: "input",
+                    options: [],
+                  },
+                ])
+              }
+            >
+              + 添加一项
+            </button>
+            <button
+              className="mini-button struct-apply"
+              onClick={applyStructure}
+            >
+              确定
+            </button>
+            <button
+              className="mini-button ghost"
+              onClick={() => setCustomOpen(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
 
       {addOpen && (
         <div className="add-fact-form">
           <div className="add-fact-grid">
-            <label className="add-fact-field">
-              <span>项目名称 *</span>
-              <input
-                value={addName}
-                onChange={(e) => setAddName(e.target.value)}
-                placeholder="如：血尿酸"
-              />
-            </label>
-            <label className="add-fact-field">
-              <span>数值 / 结果 *</span>
-              <input
-                value={addValue}
-                onChange={(e) => setAddValue(e.target.value)}
-                placeholder="如：360 或 阴性"
-              />
-            </label>
-            <label className="add-fact-field">
-              <span>单位（选填）</span>
-              <input
-                value={addUnit}
-                onChange={(e) => setAddUnit(e.target.value)}
-                placeholder="如：umol/L"
-              />
-            </label>
-            <label className="add-fact-field">
-              <span>参考范围（选填）</span>
-              <input
-                value={addRef}
-                onChange={(e) => setAddRef(e.target.value)}
-                placeholder="如：155-422"
-              />
-            </label>
-            <label className="add-fact-field">
-              <span>判定（选填）</span>
-              <select
-                value={addInterp}
-                onChange={(e) => setAddInterp(e.target.value)}
-              >
-                <option value="">未知</option>
-                <option value="normal">正常</option>
-                <option value="high">偏高</option>
-                <option value="low">偏低</option>
-              </select>
-            </label>
+            {structure.length > 0 ? (
+              <>
+                <label className="add-fact-field struct-record-name">
+                  <span>记录名称</span>
+                  <input
+                    value={recordName}
+                    onChange={(e) => setRecordName(e.target.value)}
+                    placeholder="如：体温记录"
+                  />
+                </label>
+                {structure.map((f) => (
+                  <label className="add-fact-field" key={f.id}>
+                    <span>{f.name}</span>
+                    {f.type === "select" ? (
+                      <select
+                        value={formValues[f.id] ?? ""}
+                        onChange={(e) =>
+                          setFormValues((v) => ({ ...v, [f.id]: e.target.value }))
+                        }
+                      >
+                        <option value="">请选择</option>
+                        {f.options.map((o) => (
+                          <option key={o} value={o}>
+                            {o}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                    <input
+                      value={formValues[f.id] ?? ""}
+                      onChange={(e) =>
+                        setFormValues((v) => ({ ...v, [f.id]: e.target.value }))
+                      }
+                    />
+                  )}
+                </label>
+              ))}
+              </>
+            ) : (
+              <>
+                <label className="add-fact-field">
+                  <span>项目名称 *</span>
+                  <input
+                    value={addName}
+                    onChange={(e) => setAddName(e.target.value)}
+                    placeholder="如：血尿酸"
+                  />
+                </label>
+                <label className="add-fact-field">
+                  <span>数值 / 结果 *</span>
+                  <input
+                    value={addValue}
+                    onChange={(e) => setAddValue(e.target.value)}
+                    placeholder="如：360 或 阴性"
+                  />
+                </label>
+                <label className="add-fact-field">
+                  <span>单位（选填）</span>
+                  <input
+                    value={addUnit}
+                    onChange={(e) => setAddUnit(e.target.value)}
+                    placeholder="如：umol/L"
+                  />
+                </label>
+                <label className="add-fact-field">
+                  <span>参考范围（选填）</span>
+                  <input
+                    value={addRef}
+                    onChange={(e) => setAddRef(e.target.value)}
+                    placeholder="如：155-422"
+                  />
+                </label>
+                <label className="add-fact-field">
+                  <span>判定（选填）</span>
+                  <select
+                    value={addInterp}
+                    onChange={(e) => setAddInterp(e.target.value)}
+                  >
+                    <option value="">未知</option>
+                    <option value="normal">正常</option>
+                    <option value="high">偏高</option>
+                    <option value="low">偏低</option>
+                  </select>
+                </label>
+              </>
+            )}
           </div>
           <div className="add-fact-actions">
+            {structure.length > 0 && (
+              <button
+                className="mini-button autofill-btn"
+                onClick={autoFillValues}
+                title="按字段名称匹配，把已识别出的数据填入空项"
+              >
+                自动填入
+              </button>
+            )}
             <button
               className="mini-button"
-              disabled={!addName.trim()}
+              disabled={structure.length === 0 && !addName.trim()}
               onClick={handleAdd}
             >
               添加
@@ -1122,9 +1576,37 @@ function FactReviewPanel({
         </div>
       )}
 
+      {crossCheck && crossCheck.length > 0 && (
+        <div className="cross-check-summary">
+          {(() => {
+            const verified = crossCheck.filter((c) => c.status === "verified").length;
+            const conflict = crossCheck.filter((c) => c.status === "conflict").length;
+            const notFound = crossCheck.filter(
+              (c) => c.status === "not_found",
+            ).length;
+            return (
+              <>
+                <strong>OCR × AI 比对</strong>
+                <span className="cc-ok">{verified} 项一致</span>
+                {conflict > 0 && (
+                  <span className="cc-bad">{conflict} 项与 OCR 不一致</span>
+                )}
+                {notFound > 0 && (
+                  <span className="cc-warn">{notFound} 项 OCR 未读到</span>
+                )}
+                <span className="cc-hint">
+                  （不一致 / 未读到仅提示，不代表 AI 错误，请人工核对）
+                </span>
+              </>
+            );
+          })()}
+        </div>
+      )}
+
       <div className="fact-list">
         {allFacts.map((fact) => {
           const r = review[fact.fact_id];
+          const cc = crossCheck?.find((c) => c.fact_id === fact.fact_id);
           const lowConf = (fact.confidence ?? 1) < 0.6;
           const isEditing = editingFactId === fact.fact_id;
           const cls = [
@@ -1159,6 +1641,14 @@ function FactReviewPanel({
                   fact.concept.local_display !== fact.concept.display && (
                     <span className="fact-local">{fact.concept.local_display}</span>
                   )}
+                {cc && cc.status !== "verified" && (
+                  <span
+                    className={`cc-badge cc-badge-${cc.status}`}
+                    title={cc.detail}
+                  >
+                    {cc.status === "conflict" ? "与OCR不一致" : "OCR未读到"}
+                  </span>
+                )}
               </div>
 
               <div className="fact-value">
@@ -1219,6 +1709,16 @@ function FactReviewPanel({
                   <span className="lowconf-tag">建议核对</span>
                 )}
               </div>
+
+              {factAttrChips(event.event_type, fact.attributes).length > 0 && (
+                <div className="fact-attrs">
+                  {factAttrChips(event.event_type, fact.attributes).map((chip) => (
+                    <span className="attr-chip" key={chip.label}>
+                      {chip.label}：{chip.value}
+                    </span>
+                  ))}
+                </div>
+              )}
 
               <div className="fact-actions">
                 {r?.action === "confirmed" ? (
@@ -1308,6 +1808,15 @@ function UploadPage({
   const [addError, setAddError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastFileRef = useRef<File | null>(null);
+  const dragDepthRef = useRef(0);
+  const [dragActive, setDragActive] = useState(false);
+  // The document date shown in the add-to-timeline step. Prefilled from
+  // OCR when the report date was recognized; otherwise the user picks it
+  // (year-month-day). The timeline sorts by this date, not upload time.
+  const [eventDate, setEventDate] = useState("");
+  // Narrative documents (e.g. a discharge summary) are shown as editable
+  // raw text instead of a fact list; the user edits it before adding it.
+  const [narrativeText, setNarrativeText] = useState("");
 
   useEffect(() => {
     if (uploadState.status !== "processing" || !uploadState.startedAt) {
@@ -1323,10 +1832,43 @@ function UploadPage({
     return () => window.clearInterval(timer);
   }, [uploadState.status, uploadState.startedAt]);
 
+  function handleDragEnter(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    dragDepthRef.current -= 1;
+    if (dragDepthRef.current <= 0) {
+      dragDepthRef.current = 0;
+      setDragActive(false);
+    }
+  }
+
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    const file = event.dataTransfer.files?.[0];
+    if (!file) return;
+    const okType =
+      file.type.startsWith("image/") || file.type === "application/pdf";
+    if (!okType) {
+      window.alert("请选择图片或 PDF 文件");
+      return;
+    }
+    void handleFile(file);
+  }
+
   async function handleFile(file: File) {
     lastFileRef.current = file;
-    setExtraFacts([]);
-    setReview({});
+    setExtraFacts([]);    setReview({});
     setAdded(false);
     setAddError("");
     setUploadState({
@@ -1351,6 +1893,10 @@ function UploadPage({
         result,
         qualityWarning: Boolean(result.quality && !result.quality.ok),
       });
+      setEventDate(
+        result.extracted_event?.event_time?.start?.slice(0, 10) ?? "",
+      );
+      setNarrativeText(result.extracted_event?.narrative ?? "");
       onUploaded();
     } catch (err) {
       setUploadState({
@@ -1365,6 +1911,13 @@ function UploadPage({
   }
 
   const { fileName, status, message } = uploadState;
+  // Pure imaging path: the quality gate classified this as a film shot and
+  // OCR was skipped — the right panel must not present itself as an OCR
+  // text result.
+  const isPureImaging =
+    status === "complete" &&
+    uploadState.result?.artifact.document_type === "imaging" &&
+    !uploadState.result?.artifact.ocr_text;
   // Soft asymptotic progress while waiting; jumps to 100% on complete.
   const progressPct =
     status === "complete"
@@ -1405,6 +1958,16 @@ function UploadPage({
       patient_id: session.user.patient_id,
       source_artifact_ids: [uploadState.result!.artifact.artifact_id],
       facts,
+      narrative: ev.narrative ? narrativeText : ev.narrative,
+      // Timeline sorts by the document date, not upload time: keep the
+      // OCR-recognized date unless the user changed/cleared it, and let
+      // the user fill in the date when the image had no recognizable one.
+      event_time: {
+        start: eventDate || null,
+        end: null,
+        precision: eventDate ? "day" : "unknown",
+        source: "patient",
+      },
     };
     try {
       await addTimelineEvent(session.user.patient_id, session.token, payload);
@@ -1427,7 +1990,13 @@ function UploadPage({
 
       <div className="upload-layout">
         <article className="upload-card">
-          <label className="drop-zone">
+          <label
+            className={dragActive ? "drop-zone is-dragging" : "drop-zone"}
+            onDragEnter={handleDragEnter}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+          >
             <input
               ref={fileInputRef}
               type="file"
@@ -1438,9 +2007,13 @@ function UploadPage({
               }}
             />
             <span className="upload-symbol">+</span>
-            <strong>{fileName ?? "选择图片或 PDF"}</strong>
-            <p>检验单、影像报告、处方、门诊病历、出院记录均可</p>
-            <span className="secondary-button">选择文件</span>
+            <strong>{fileName ?? "选择或拖入图片 / PDF"}</strong>
+            <p>
+              把报告文件直接拖到这里，或点击选择；检验单、影像报告、处方、门诊病历均可
+            </p>
+            <span className="secondary-button">
+              {dragActive ? "松开即可上传" : "选择文件"}
+            </span>
           </label>
 
           {status !== "idle" && (
@@ -1485,6 +2058,20 @@ function UploadPage({
                           : "提取完成，审核后可点击「加入时间轴」"
                         : (message ?? "请检查 API 与登录状态")}
                     </span>
+                    {status === "complete" && !added && (
+                      <label className="event-date-field">
+                        <span className="event-date-hint">
+                          {eventDate
+                            ? "单据日期（已从图上识别，请核对）"
+                            : "单据日期（图上未识别到，请选择）"}
+                        </span>
+                        <input
+                          type="date"
+                          value={eventDate}
+                          onChange={(event) => setEventDate(event.target.value)}
+                        />
+                      </label>
+                    )}
                   </div>
                   {status === "complete" ? (
                     <div className="retry-actions">
@@ -1516,11 +2103,13 @@ function UploadPage({
         </article>
 
         <article className="panel ingest-explainer">
-          <span className="eyebrow">OCR 识别结果</span>
+          <span className="eyebrow">
+            {isPureImaging ? "影像处理结果" : "OCR 识别结果"}
+          </span>
           <h2>
             {status === "idle" && "上传后在此查看识别原文"}
-            {status === "processing" && "正在识别文字…"}
-            {status === "complete" && "识别完成"}
+            {status === "processing" && "正在识别…"}
+            {status === "complete" && (isPureImaging ? "影像原图已保存" : "识别完成")}
             {status === "offline" && "识别失败"}
           </h2>
           {status === "idle" && (
@@ -1530,13 +2119,14 @@ function UploadPage({
             </p>
           )}
           {status === "processing" && (
-            <p>正在调用本地 OCR 引擎识别报告文字，请稍候…</p>
+            <p>正在分析图片，请稍候…</p>
           )}
           {status === "complete" && uploadState.result && (
             uploadState.result.extracted_event?.facts?.length ? (
               <FactReviewPanel
                 event={uploadState.result.extracted_event}
                 ocrText={uploadState.result.artifact.ocr_text}
+                crossCheck={uploadState.result.cross_check ?? []}
                 review={review}
                 setReview={setReview}
                 editingFactId={editingFactId}
@@ -1546,6 +2136,32 @@ function UploadPage({
                 extraFacts={extraFacts}
                 setExtraFacts={setExtraFacts}
               />
+            ) : uploadState.result.extracted_event?.narrative ? (
+              <div className="ocr-result">
+                <div className="ocr-meta">
+                  <span>
+                    引擎：{uploadState.result.artifact.ocr_engine ?? "—"}
+                  </span>
+                  <span>状态：{uploadState.result.status}</span>
+                </div>
+                <p className="no-facts-hint">
+                  识别为叙述性文档（如出院记录），AI 判断不分条：以下是按原文顺序提取的完整文字，可直接编辑，核对后加入时间轴
+                </p>
+                <textarea
+                  className="narrative-edit"
+                  rows={14}
+                  value={narrativeText}
+                  onChange={(e) => setNarrativeText(e.target.value)}
+                  placeholder="（原文）"
+                />
+              </div>
+            ) : uploadState.result.artifact.document_type === "imaging" &&
+              !uploadState.result.artifact.ocr_text ? (
+              <div className="ocr-result">
+                <p className="no-facts-hint">
+                  检测为影像原图：未识别到文字，原图已保存。确认后点击「加入时间轴」，会同时出现在时间轴的「全部」和「影像」板块。
+                </p>
+              </div>
             ) : (
               <div className="ocr-result">
                 <div className="ocr-meta">
@@ -1571,50 +2187,16 @@ function UploadPage({
       </div>
 
       {uploadState.qualityWarning && uploadState.result?.quality && (
-        <div
-          className="quality-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label="清晰度提示"
-        >
-          <div className="quality-modal">
-            <span className="eyebrow">识别质量提示</span>
-            <h2>清晰度过低，建议重新拍摄</h2>
-            <p>
-              这张图片{uploadState.result.quality.issues.join("、")}，可能影响识别准确率。
-            </p>
-            <ul className="quality-issues">
-              {uploadState.result.quality.issues.map((issue) => (
-                <li key={issue}>
-                  {issue === "分辨率过低"
-                    ? "图片太小，文字细节不足"
-                    : issue === "图片模糊"
-                      ? "画面发虚，文字边缘不清晰"
-                      : "画面偏暗，文字看不清"}
-                </li>
-              ))}
-            </ul>
-            <div className="quality-actions">
-              <button
-                className="primary-button"
-                onClick={() => setUploadState(emptyUploadState)}
-              >
-                重新拍摄
-              </button>
-              <button
-                className="secondary-button"
-                onClick={() =>
-                  setUploadState((prev) => ({
-                    ...prev,
-                    qualityWarning: false,
-                  }))
-                }
-              >
-                仍要上传
-              </button>
-            </div>
-          </div>
-        </div>
+        <QualityWarningModal
+          quality={uploadState.result.quality}
+          onRetake={() => setUploadState(emptyUploadState)}
+          onKeep={() =>
+            setUploadState((prev) => ({
+              ...prev,
+              qualityWarning: false,
+            }))
+          }
+        />
       )}
 
       {retryOpen && (

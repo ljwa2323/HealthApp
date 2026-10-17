@@ -117,6 +117,7 @@ class ClinicalEvent(BaseModel):
     source_artifact_ids: list[str] = Field(default_factory=list)
     facts: list[ClinicalFact] = Field(default_factory=list)
     summary: str | None = None
+    narrative: str | None = None
 
 
 class SourceArtifact(BaseModel):
@@ -159,6 +160,10 @@ class IngestionResult(BaseModel):
     pipeline_steps: list[str]
     extracted_event: ClinicalEvent | None = None
     quality: dict | None = None
+    # OCR x AI cross-check: one entry per extracted fact, marking whether
+    # the raw OCR text supports (verified) or contradicts (conflict) the
+    # AI extraction, or never mentioned it (not_found).
+    cross_check: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentContext(BaseModel):

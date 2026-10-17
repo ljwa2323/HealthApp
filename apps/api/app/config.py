@@ -32,6 +32,42 @@ def get_nvidia_api_key() -> str | None:
     return None
 
 
+@lru_cache(maxsize=1)
+def get_deepseek_api_key() -> str | None:
+    env_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if env_key and not env_key.startswith("$"):
+        return env_key
+
+    here = Path(__file__).resolve()
+    repo_root = here.parents[3]
+    cwd = Path.cwd()
+    for path in (cwd / "deepseek_key.txt", repo_root / "deepseek_key.txt"):
+        if not path.is_file():
+            continue
+        value = path.read_text(encoding="utf-8").strip()
+        if value and not value.startswith("$"):
+            return value
+    return None
+
+
+@lru_cache(maxsize=1)
+def get_glm_api_key() -> str | None:
+    env_key = os.environ.get("GLM_API_KEY", "").strip()
+    if env_key and not env_key.startswith("$"):
+        return env_key
+
+    here = Path(__file__).resolve()
+    repo_root = here.parents[3]
+    cwd = Path.cwd()
+    for path in (cwd / "glm_key.txt", repo_root / "glm_key.txt"):
+        if not path.is_file():
+            continue
+        value = path.read_text(encoding="utf-8").strip()
+        if value and not value.startswith("$"):
+            return value
+    return None
+
+
 OCR_INVOKE_URL = "https://ai.api.nvidia.com/v1/cv/nvidia/nemotron-ocr-v2"
 LLM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 LLM_MODEL = "nvidia/nemotron-3-super-120b-a12b"

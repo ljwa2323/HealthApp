@@ -29,3 +29,10 @@ uploads/
 
 # Local OCR smoke test artifacts
 apps/api/_ocr_smoke.*
+
+# Dev scratch / verification scripts (not part of the app source)
+apps/api/_*.py
+apps/api/_*.out
+apps/api/_*.log
+apps/api/_*.txt
+apps/api/_*.png
