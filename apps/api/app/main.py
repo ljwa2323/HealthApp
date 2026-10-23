@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .auth import get_current_user, require_patient_access
@@ -25,7 +25,7 @@ from .schemas import (
 )
 from .services.auth_store import UserRecord, get_store
 from .services.context_builder import build_agent_context
-from .services.health_agent import analyze_health, answer_question
+from .services.health_assistant import answer_question, answer_question_stream
 from .services.ingestion import ingest_document
 
 app = FastAPI(
@@ -294,6 +294,63 @@ async def upload_document(
     return result
 
 
+@app.post("/api/patients/{patient_id}/documents/{artifact_id}/split")
+async def split_document(
+    patient_id: str,
+    artifact_id: str,
+    user: UserRecord = Depends(require_patient_access),
+):
+    """On-demand splitting.
+
+    At upload time narrative documents (discharge summaries, progress
+    notes…) are kept as raw text without pre-splitting, so the initial
+    extraction stays fast. When the user taps 分条展示, this endpoint
+    re-reads the saved original and forces structured extraction.
+    """
+    artifact = get_store().get_artifact(user.patient_id, artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    path = Path(artifact.storage_path)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Original file missing on disk")
+    content = path.read_bytes()
+
+    from .schemas import SourceArtifact
+    from .services.cross_check import cross_check_facts
+    from .services.nvidia_providers import GLMVisionNormalizer
+    from .services.rapid_ocr_provider import RapidOCRProvider
+
+    source = SourceArtifact(
+        artifact_id=artifact.artifact_id,
+        patient_id=user.patient_id,
+        file_name=artifact.file_name,
+        media_type=artifact.media_type,
+        storage_uri=artifact.storage_path,
+    )
+    try:
+        event = await GLMVisionNormalizer().normalize_image(
+            user.patient_id, source, content, force_structured=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Split failed: {exc}") from exc
+    if event is None:
+        raise HTTPException(status_code=502, detail="Split failed: no result")
+
+    # Re-run the local OCR for the cross-check (fast; OCR text is not
+    # persisted on the artifact row).
+    try:
+        ocr = await RapidOCRProvider().recognize(content, artifact.media_type)
+        cross_check = cross_check_facts(ocr.text, event.facts)
+    except Exception:  # noqa: BLE001 - cross-check is advisory only
+        cross_check = []
+
+    return {
+        "event": event,
+        "facts": event.facts,
+        "cross_check": cross_check,
+    }
+
+
 @app.get("/api/patients/{patient_id}/artifacts/{artifact_id}")
 def get_artifact_file(
     patient_id: str,
@@ -346,21 +403,78 @@ async def assistant_analyze(
             status_code=400,
             detail="No timeline records available for analysis",
         )
-    context = build_agent_context(
-        patient_id=user.patient_id,
-        task=payload.task,
-        events=events,
-    )
     try:
-        result = await analyze_health(context)
+        result = await answer_question(
+            question="请基于我的时间轴做一次整体健康回顾。",
+            events=events,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return AssistantReply(
         answer=result["answer"],
-        evidence_refs=result.get("evidence_refs") or [],
-        used_fact_ids=[item for item in (result.get("used_fact_ids") or []) if item],
+        evidence_refs=[],
+        used_fact_ids=result.get("used_fact_ids") or [],
         context=result.get("context"),
     )
+
+
+@app.get("/api/patients/{patient_id}/conversations")
+def list_conversations(
+    patient_id: str,
+    q: str = "",
+    user: UserRecord = Depends(require_patient_access),
+):
+    return {"conversations": get_store().list_conversations(user.patient_id, search=q)}
+
+
+@app.post("/api/patients/{patient_id}/conversations")
+def create_conversation(
+    patient_id: str,
+    payload: dict,
+    user: UserRecord = Depends(require_patient_access),
+):
+    title = (payload.get("title") or "新对话").strip()[:80]
+    return get_store().create_conversation(user.patient_id, title)
+
+
+@app.get("/api/patients/{patient_id}/conversations/{conversation_id}")
+def get_conversation(
+    patient_id: str,
+    conversation_id: str,
+    user: UserRecord = Depends(require_patient_access),
+):
+    conv = get_store().get_conversation(user.patient_id, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conv
+
+
+@app.patch("/api/patients/{patient_id}/conversations/{conversation_id}")
+def rename_conversation(
+    patient_id: str,
+    conversation_id: str,
+    payload: dict,
+    user: UserRecord = Depends(require_patient_access),
+):
+    title = (payload.get("title") or "").strip()[:80]
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    ok = get_store().rename_conversation(user.patient_id, conversation_id, title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"ok": True}
+
+
+@app.delete("/api/patients/{patient_id}/conversations/{conversation_id}")
+def delete_conversation(
+    patient_id: str,
+    conversation_id: str,
+    user: UserRecord = Depends(require_patient_access),
+):
+    ok = get_store().delete_conversation(user.patient_id, conversation_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"ok": True}
 
 
 @app.post(
@@ -381,24 +495,94 @@ async def assistant_chat(
             status_code=400,
             detail="No timeline records available for chat",
         )
-    context = build_agent_context(
-        patient_id=user.patient_id,
-        task=payload.task,
-        events=events,
-    )
+
+    store = get_store()
+    conv_id = payload.conversation_id
+    if conv_id:
+        conv = store.get_conversation(user.patient_id, conv_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        # 自动建对话，标题取问题前 20 字
+        conv = store.create_conversation(user.patient_id, question[:20])
+        conv_id = conv["conversation_id"]
+
+    store.append_message(user.patient_id, conv_id, "user", question)
+
     try:
         result = await answer_question(
-            context=context,
             question=question,
+            events=events,
             history=[item.model_dump() for item in payload.history],
         )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    store.append_message(user.patient_id, conv_id, "assistant", result["answer"])
+
     return AssistantReply(
         answer=result["answer"],
-        evidence_refs=result.get("evidence_refs") or [],
-        used_fact_ids=[],
+        evidence_refs=[],
+        used_fact_ids=result.get("used_fact_ids") or [],
         context=result.get("context"),
+        conversation_id=conv_id,
+    )
+
+
+@app.post("/api/patients/{patient_id}/assistant/chat/stream")
+async def assistant_chat_stream(
+    patient_id: str,
+    payload: AssistantChatRequest,
+    user: UserRecord = Depends(require_patient_access),
+):
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    events = get_store().list_events(user.patient_id)
+    if not events:
+        raise HTTPException(
+            status_code=400,
+            detail="No timeline records available for chat",
+        )
+
+    store = get_store()
+    conv_id = payload.conversation_id
+    if conv_id:
+        conv = store.get_conversation(user.patient_id, conv_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        conv = store.create_conversation(user.patient_id, question[:20])
+        conv_id = conv["conversation_id"]
+
+    store.append_message(user.patient_id, conv_id, "user", question)
+    collected: list[str] = []
+
+    async def event_generator():
+        try:
+            async for piece in answer_question_stream(
+                question=question,
+                events=events,
+                history=[item.model_dump() for item in payload.history],
+            ):
+                if piece.get("type") == "chunk":
+                    collected.append(piece.get("text", ""))
+                if piece.get("type") == "start":
+                    piece["conversation_id"] = conv_id
+                yield f"data: {json.dumps(piece, ensure_ascii=False)}\n\n"
+            full = "".join(collected)
+            if full:
+                store.append_message(user.patient_id, conv_id, "assistant", full)
+        except ValueError as exc:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
     )
 
 

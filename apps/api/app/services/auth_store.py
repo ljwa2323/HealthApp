@@ -102,11 +102,24 @@ class AuthStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    patient_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    messages_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(patient_id) REFERENCES users(patient_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_events_patient
                 ON events(patient_id);
 
                 CREATE INDEX IF NOT EXISTS idx_artifacts_patient
                 ON artifacts(patient_id);
+
+                CREATE INDEX IF NOT EXISTS idx_conversations_patient
+                ON conversations(patient_id);
                 """
             )
 
@@ -432,6 +445,100 @@ class AuthStore:
             storage_path=row["storage_path"],
             created_at=row["created_at"],
         )
+
+    # ---- conversations ----
+
+    def create_conversation(self, patient_id: str, title: str) -> dict:
+        conv_id = f"conv_{uuid4().hex[:12]}"
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO conversations
+                   (conversation_id, patient_id, title, messages_json, created_at, updated_at)
+                   VALUES (?, ?, ?, '[]', ?, ?)""",
+                (conv_id, patient_id, title, now, now),
+            )
+        return {"conversation_id": conv_id, "title": title, "messages": [], "created_at": now, "updated_at": now}
+
+    def list_conversations(self, patient_id: str, search: str = "") -> list[dict]:
+        sql = "SELECT conversation_id, title, messages_json, created_at, updated_at FROM conversations WHERE patient_id = ?"
+        params: list = [patient_id]
+        if search:
+            sql += " AND (title LIKE ? OR messages_json LIKE ?)"
+            like = f"%{search}%"
+            params.extend([like, like])
+        sql += " ORDER BY updated_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "conversation_id": r["conversation_id"],
+                "title": r["title"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "preview": self._preview_from_messages(r["messages_json"]),
+            }
+            for r in rows
+        ]
+
+    @staticmethod
+    def _preview_from_messages(messages_json: str, max_len: int = 60) -> str:
+        try:
+            msgs = json.loads(messages_json)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                text = m.get("content", "")
+                return text[:max_len] + ("…" if len(text) > max_len else "")
+        return ""
+
+    def get_conversation(self, patient_id: str, conversation_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT conversation_id, title, messages_json, created_at, updated_at
+                   FROM conversations WHERE patient_id = ? AND conversation_id = ?""",
+                (patient_id, conversation_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "conversation_id": row["conversation_id"],
+            "title": row["title"],
+            "messages": json.loads(row["messages_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def append_message(self, patient_id: str, conversation_id: str, role: str, content: str) -> bool:
+        conv = self.get_conversation(patient_id, conversation_id)
+        if conv is None:
+            return False
+        messages = conv["messages"]
+        messages.append({"role": role, "content": content})
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET messages_json = ?, updated_at = ? WHERE patient_id = ? AND conversation_id = ?",
+                (json.dumps(messages, ensure_ascii=False), now, patient_id, conversation_id),
+            )
+        return True
+
+    def rename_conversation(self, patient_id: str, conversation_id: str, title: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE patient_id = ? AND conversation_id = ?",
+                (title, datetime.now(timezone.utc).isoformat(), patient_id, conversation_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_conversation(self, patient_id: str, conversation_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM conversations WHERE patient_id = ? AND conversation_id = ?",
+                (patient_id, conversation_id),
+            )
+            return cur.rowcount > 0
 
     @staticmethod
     def _row_to_user(row: sqlite3.Row) -> UserRecord:

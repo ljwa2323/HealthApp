@@ -27,6 +27,132 @@ from .ingestion import ClinicalNormalizer, OCRProvider, OCRResult
 
 RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
+# Common lab-item units, used as a deterministic fallback when the vision
+# model omits the unit (it frequently does). Longest key wins on substring
+# match so "白细胞计数" resolves before "白细胞".
+_UNIT_MAP: dict[str, str] = {
+    # CBC
+    "白细胞计数": "10^9/L",
+    "白细胞": "10^9/L",
+    "红细胞计数": "10^12/L",
+    "红细胞": "10^12/L",
+    "血红蛋白": "g/L",
+    "血小板计数": "10^9/L",
+    "血小板": "10^9/L",
+    "中性粒细胞百分比": "%",
+    "淋巴细胞百分比": "%",
+    "单核细胞百分比": "%",
+    "嗜酸性粒细胞百分比": "%",
+    "嗜碱性粒细胞百分比": "%",
+    "中性粒细胞绝对值": "10^9/L",
+    "淋巴细胞绝对值": "10^9/L",
+    "单核细胞绝对值": "10^9/L",
+    "嗜酸性粒细胞绝对值": "10^9/L",
+    "嗜碱性粒细胞绝对值": "10^9/L",
+    "红细胞比容": "%",
+    "红细胞压积": "%",
+    "平均红细胞体积": "fL",
+    "平均血红蛋白量": "pg",
+    "平均血红蛋白浓度": "g/L",
+    "红细胞分布宽度": "%",
+    # Chemistry
+    "谷丙转氨酶": "U/L",
+    "丙氨酸氨基转移酶": "U/L",
+    "谷草转氨酶": "U/L",
+    "天冬氨酸氨基转移酶": "U/L",
+    "γ-谷氨酰转肽酶": "U/L",
+    "γ-谷氨酰转移酶": "U/L",
+    "谷氨酰转肽酶": "U/L",
+    "碱性磷酸酶": "U/L",
+    "乳酸脱氢酶": "U/L",
+    "肌酸激酶": "U/L",
+    "肌酸激酶同工酶": "U/L",
+    "α-羟丁酸脱氢酶": "U/L",
+    "总胆红素": "umol/L",
+    "直接胆红素": "umol/L",
+    "间接胆红素": "umol/L",
+    "总蛋白": "g/L",
+    "白蛋白": "g/L",
+    "球蛋白": "g/L",
+    "白球比": "",
+    "前白蛋白": "mg/L",
+    "肌酐": "umol/L",
+    "尿素": "mmol/L",
+    "尿素氮": "mmol/L",
+    "血尿素氮": "mmol/L",
+    "尿酸": "umol/L",
+    "胱抑素C": "mg/L",
+    "β2-微球蛋白": "mg/L",
+    "血糖": "mmol/L",
+    "空腹血糖": "mmol/L",
+    "糖化血红蛋白": "%",
+    "甘油三酯": "mmol/L",
+    "总胆固醇": "mmol/L",
+    "高密度脂蛋白胆固醇": "mmol/L",
+    "低密度脂蛋白胆固醇": "mmol/L",
+    "载脂蛋白A1": "g/L",
+    "载脂蛋白B": "g/L",
+    "脂蛋白a": "mg/L",
+    "钾": "mmol/L",
+    "钠": "mmol/L",
+    "氯": "mmol/L",
+    "钙": "mmol/L",
+    "磷": "mmol/L",
+    "镁": "mmol/L",
+    "铁": "umol/L",
+    "总铁结合力": "umol/L",
+    "转铁蛋白": "g/L",
+    "铁蛋白": "ug/L",
+    "同型半胱氨酸": "umol/L",
+    "C反应蛋白": "mg/L",
+    "超敏C反应蛋白": "mg/L",
+    "降钙素原": "ng/mL",
+    "淀粉酶": "U/L",
+    "脂肪酶": "U/L",
+    # Thyroid
+    "促甲状腺激素": "mIU/L",
+    "游离三碘甲状腺原氨酸": "pmol/L",
+    "游离甲状腺素": "pmol/L",
+    "三碘甲状腺原氨酸": "nmol/L",
+    "甲状腺素": "nmol/L",
+    "甲状腺过氧化物酶抗体": "IU/mL",
+    "甲状腺球蛋白抗体": "IU/mL",
+    # Urine
+    "尿蛋白": "g/L",
+    "尿微量白蛋白": "mg/L",
+    "尿比重": "",
+    "尿潜血": "cell/uL",
+    "尿白细胞": "cell/uL",
+    "尿红细胞": "cell/uL",
+    # HBV / serology
+    "乙肝表面抗原": "IU/mL",
+    "乙肝表面抗体": "mIU/mL",
+    "乙肝e抗原": "S/CO",
+    "乙肝e抗体": "S/CO",
+    "乙肝核心抗体": "S/CO",
+    "甲胎蛋白": "ng/mL",
+    # Vital signs
+    "血压": "mmHg",
+    "收缩压": "mmHg",
+    "舒张压": "mmHg",
+    "心率": "次/分",
+    "脉搏": "次/分",
+    "呼吸频率": "次/分",
+    "体温": "℃",
+    "体重": "kg",
+    "身高": "cm",
+    # Glucose / lipids units often shown as mmol/L in Chinese reports
+    "糖化白蛋白": "%",
+}
+
+
+def _unit_for_concept(concept: str) -> str | None:
+    """Deterministic unit fallback for common lab items (longest match first)."""
+    keys = sorted((k for k in _UNIT_MAP if k in concept), key=len, reverse=True)
+    if not keys:
+        return None
+    return _UNIT_MAP[keys[0]] or None
+
 
 def _prepare_ocr_image(content: bytes, media_type: str | None) -> tuple[bytes, str]:
     """Convert uploads into a JPEG that fits NVIDIA inline OCR size limits."""
@@ -603,9 +729,17 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/jpeg;base64,{b64}"
 
-    def _build_prompt(self, artifact: SourceArtifact) -> str:
+    def _build_prompt(self, artifact: SourceArtifact, force_structured: bool = False) -> str:
+        mode_rule = (
+            "用户选择了「分条展示」：这份文档必须分条提取。即使是叙述型文字（出院记录、病程等），"
+            "也要把明确的信息拆成分项 facts（诊断、日期、药名剂量、检查结论、医嘱等各成一条）；"
+            "无法拆分的信息归为一条 note 事实；narrative_text 写 null，不要输出整段原文。\n"
+            if force_structured
+            else ""
+        )
         return (
-            "你是医疗文档结构化助手。请直接看图，先判断这是哪一种医疗文档，再按对应规则提取。\n"
+            mode_rule
+            + "你是医疗文档结构化助手。请直接看图，先判断这是哪一种医疗文档，再按对应规则提取。\n"
             "document_type 只可能是以下 9 种之一：\n"
             "- laboratory: 检验/化验报告（血常规、生化、尿常规、甲功、乙肝等），逐项提取 项目名/数值/单位/参考范围/高低\n"
             "- medication: 处方/用药单，提取 药名/剂量/频次(如 qd、bid、每日3次)/用法(口服、静滴、外用)/数量\n"
@@ -615,12 +749,12 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             "- procedure: 手术/操作记录，提取 手术名称/麻醉方式/术者/术前诊断/术后诊断/日期\n"
             "- vital: 生命体征记录（血压/心率/体温等），提取 项目/数值/单位\n"
             "- symptom: 症状记录/症状量表，提取 症状名/描述/持续时间\n"
-            "- other: 以上都不是的其他医疗文档，提取要点摘要。注意：诊断证明书、疾病证明、请假条、病情说明等单页证明文书属于 other（不是 visit），即使上面印有科室/姓名\n"
+            "- other: 以上都不是的其他医疗文档，提取要点摘要。注意：单独的诊断证明书、疾病证明、请假条、病情说明等单页证明文书属于 other（不是 visit），即使上面印有科室/姓名；但出院诊断证明、出院记录、出院小结属于 hospitalization（不是 other）\n"
             "注意：纯影像原图（胶片照片，没有文字报告）不在这里，不要选 imaging。\n"
             "报告可能是多列布局，请按表格行列对应关系提取，不要漏项，不要把左右两列混在一起。\n"
             "先判断文档是结构化还是叙述型：\n"
             "- format=structured：数据型/分项型文档（化验单、表格、处方、逐项记录），提取 facts；\n"
-            "- format=narrative：叙述型整段文字文档（出院记录、入院记录、病程记录、诊断意见、证明文书等一整段话），不要把一段话硬拆成多条 facts——此时 facts 留空，把全文按阅读顺序完整抄进 narrative_text（保持原有语句顺序，不改写、不省略、不翻译）。\n"
+            "- format=narrative：叙述型整段文字文档（出院记录、入院记录、病程记录、诊断意见、证明文书等一整段话），此时不要分条：facts 留空，把全文按阅读顺序完整抄进 narrative_text（保持原有语句顺序，不改写、不省略、不翻译）。\n"
             "输出一个 JSON 对象（不要 markdown 代码块、不要注释），格式如下：\n"
             "{\n"
             '  "document_type": "9种之一",\n'
@@ -643,6 +777,7 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             "   laboratory、vital、other 的 attrs 留空 {}；\n"
             "3. value 若是文字结果（如 阴性/阳性/未见）则填字符串；\n"
             "4. 没有对应信息就写 null，不要编造。\n"
+            "5. 不要使用 format=narrative 或 narrative_text，所有文档（包括出院小结、诊断证明、病程记录）都必须按字段拆成 facts 数组，不要整段文本\n"
             f"文件名：{artifact.file_name}。只输出这个 JSON 对象。"
         )
 
@@ -651,6 +786,7 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         patient_id: str,
         artifact: SourceArtifact,
         content: bytes,
+        force_structured: bool = False,
     ) -> ClinicalEvent | None:
         if not content:
             return None
@@ -659,7 +795,10 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": self._build_prompt(artifact)},
+                    {
+                        "type": "text",
+                        "text": self._build_prompt(artifact, force_structured),
+                    },
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -730,9 +869,9 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             }
 
         # Narrative documents (discharge summaries, progress notes, etc.)
-        # are kept as raw readable text instead of being split into facts.
-        # The user reviews/edits the text on the right and decides whether
-        # to add it to the timeline; the AI already judged the split.
+        # are kept as raw readable text; splitting is on-demand via the
+        # /split endpoint (user taps "分条展示"), so initial extraction
+        # must NOT spend time pre-splitting into facts.
         if str(payload.get("format") or "structured").strip().lower() == "narrative":
             narrative = str(
                 payload.get("narrative_text") or payload.get("summary") or ""
@@ -744,6 +883,10 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                 return ClinicalEvent.model_validate(event)
 
         facts: list[dict[str, Any]] = []
+        # visit/hospitalization carry their dates in fact attrs; hoist the
+        # earliest document date into event_time when the model did not
+        # provide report_date, so timeline and agent context stay ordered.
+        hoisted_dates: list[str] = []
         for raw in payload.get("facts") or []:
             if not isinstance(raw, dict):
                 continue
@@ -769,15 +912,50 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                     }
                 ],
             }
-            if payload.get("report_date"):
+            # Type-specific fields (dose/frequency/route/department/anesthesia…)
+            # land in `attributes` so the frontend can render per-type templates.
+            attrs: dict[str, Any] = {}
+            raw_attrs = raw.get("attrs") or raw.get("attributes") or {}
+            if isinstance(raw_attrs, dict):
+                for key, val in raw_attrs.items():
+                    if val is None or str(val).strip() == "":
+                        continue
+                    attrs[str(key)] = str(val)
+            detail = raw.get("detail")
+            if detail:
+                attrs.setdefault("detail", str(detail))
+
+            # Fact-level time: explicit model field first, then known date
+            # attribute keys (admission_date / discharge_date / 就诊日期…).
+            fact_time = raw.get("time") or raw.get("date")
+            if not fact_time:
+                for date_key in ("admission_date", "discharge_date", "visit_date", "operation_date"):
+                    candidate = str(attrs.get(date_key) or "").strip()
+                    if candidate:
+                        fact_time = candidate
+                        break
+            if fact_time:
+                fact["time"] = {
+                    "start": str(fact_time),
+                    "precision": "day",
+                    "source": "document",
+                }
+            elif payload.get("report_date"):
                 fact["time"] = {
                     "start": payload["report_date"],
                     "precision": "day",
                     "source": "document",
                 }
 
+            for date_key in ("admission_date", "discharge_date", "visit_date"):
+                candidate = str(attrs.get(date_key) or "").strip()
+                if candidate:
+                    hoisted_dates.append(candidate)
+
             value = raw.get("value")
             unit = raw.get("unit")
+            if not unit:
+                unit = _unit_for_concept(concept_display)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 fact["value"] = {
                     "type": "quantity",
@@ -794,21 +972,25 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                 interp = "unknown"
             fact["interpretation"] = interp
 
-            # Type-specific fields (dose/frequency/route/department/anesthesia…)
-            # land in `attributes` so the frontend can render per-type templates.
-            attrs: dict[str, Any] = {}
-            raw_attrs = raw.get("attrs") or raw.get("attributes") or {}
-            if isinstance(raw_attrs, dict):
-                for key, val in raw_attrs.items():
-                    if val is None or str(val).strip() == "":
-                        continue
-                    attrs[str(key)] = str(val)
-            detail = raw.get("detail")
-            if detail:
-                attrs.setdefault("detail", str(detail))
             if attrs:
                 fact["attributes"] = attrs
             facts.append(fact)
+
+        # Hoist the earliest document-level date to event_time when the model
+        # did not return report_date (e.g. visit/hospitalization docs).
+        if not payload.get("report_date") and hoisted_dates:
+            try:
+                earliest = min(
+                    (d for d in hoisted_dates if re.match(r"^\d{4}-\d{2}-\d{2}", str(d))),
+                    key=lambda d: str(d)[:10],
+                )
+                event["event_time"] = {
+                    "start": str(earliest)[:10],
+                    "precision": "day",
+                    "source": "document",
+                }
+            except ValueError:
+                pass
 
         event["facts"] = facts
         return ClinicalEvent.model_validate(event)

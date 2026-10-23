@@ -73,6 +73,21 @@ def _context_window(norm_text: str, pos: int, size: int = 300) -> str:
     return norm_text[start : pos + size]
 
 
+def _near(a: float, b: float) -> bool:
+    """Tolerance-aware comparison (same as the field-evaluation matcher)."""
+    return abs(a - b) <= 0.5 or (a != 0 and abs(a - b) / abs(a) <= 0.05)
+
+
+def _concept_tokens(c_norm: str) -> list[str]:
+    """Split a concept like "ast谷草转氨酶" into matchable tokens.
+
+    The vision model often emits combined names (EN abbrev + CN full name);
+    OCR text usually contains only one form. Any token hit counts as found.
+    """
+    tokens = [t for t in re.split(r"[\s/]+", c_norm) if len(t) >= 2]
+    return tokens
+
+
 def cross_check_facts(
     ocr_text: str | None,
     facts: list[ClinicalFact],
@@ -86,9 +101,16 @@ def cross_check_facts(
         if not concept:
             continue
         c_norm = _norm(concept)
-        if not c_norm:
+        tokens = _concept_tokens(c_norm)
+        if not tokens:
             continue
-        pos = norm_text.find(c_norm)
+
+        pos = -1
+        for token in tokens:
+            hit = norm_text.find(token)
+            if hit >= 0:
+                pos = hit
+                break
         if pos < 0:
             results.append(
                 {
@@ -115,10 +137,15 @@ def cross_check_facts(
                 except ValueError:
                     return None
 
-            # Compare numerically: AI "135.0" must match OCR "135".
-            ctx_values = {v for v in (_num(t) for t in ctx_tokens) if v is not None}
-            matched = [t for t in val_tokens if _num(t) in ctx_values]
-            if len(matched) == len(val_tokens):
+            val_floats = [v for v in (_num(t) for t in val_tokens) if v is not None]
+            ctx_floats = [v for v in (_num(t) for t in ctx_tokens) if v is not None]
+
+            # Tolerance-aware: AI "135.0" matches OCR "135"; a nearby row's
+            # number must NOT be required to match exactly (multi-column
+            # OCR windows mix adjacent cells).
+            if val_floats and any(
+                _near(v, c) for v in val_floats for c in ctx_floats
+            ):
                 results.append(
                     {
                         "fact_id": fact.fact_id,

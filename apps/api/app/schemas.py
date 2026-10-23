@@ -229,6 +229,7 @@ class AssistantChatRequest(BaseModel):
     question: str
     history: list[AssistantChatMessage] = Field(default_factory=list)
     task: str = "general_longitudinal_review"
+    conversation_id: str | None = None
 
 
 class AssistantReply(BaseModel):
@@ -236,3 +237,4 @@ class AssistantReply(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
     used_fact_ids: list[str] = Field(default_factory=list)
     context: dict[str, Any] | None = None
+    conversation_id: str | None = None

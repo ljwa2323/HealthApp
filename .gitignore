@@ -36,3 +36,8 @@ apps/api/_*.out
 apps/api/_*.log
 apps/api/_*.txt
 apps/api/_*.png
+apps/api/_*.json
+
+# Frontend dev logs
+apps/web/_*.log
+apps/web/_*.err.log

@@ -8,11 +8,15 @@ import {
   AssistantReply,
   changePassword,
   clearSession,
+  ConversationSummary,
+  deleteConversation,
   deleteTimelineEvent,
   ExtractedEvent,
   ExtractedFact,
   fetchArtifactObjectUrl,
   fetchTimeline,
+  getConversation,
+  listConversations,
   loadStoredSession,
   loginUser,
   logoutUser,
@@ -23,6 +27,7 @@ import {
   updateTimelineEvent,
   UploadResult,
   uploadHealthRecord,
+  splitDocument,
 } from "./api";
 import type { TimelineEvent } from "./types";
 
@@ -48,6 +53,10 @@ type AssistantState = {
   busy: boolean;
   error: string | null;
   contextPreview: AssistantReply["context"] | null;
+  conversationId: string | null;
+  conversations: ConversationSummary[];
+  searchQuery: string;
+  loadingConversations: boolean;
 };
 
 const emptyUploadState: UploadState = {
@@ -65,6 +74,10 @@ const emptyAssistantState: AssistantState = {
   busy: false,
   error: null,
   contextPreview: null,
+  conversationId: null,
+  conversations: [],
+  searchQuery: "",
+  loadingConversations: false,
 };
 
 const eventTypeLabel: Record<string, string> = {
@@ -1814,9 +1827,24 @@ function UploadPage({
   // OCR when the report date was recognized; otherwise the user picks it
   // (year-month-day). The timeline sorts by this date, not upload time.
   const [eventDate, setEventDate] = useState("");
-  // Narrative documents (e.g. a discharge summary) are shown as editable
-  // raw text instead of a fact list; the user edits it before adding it.
-  const [narrativeText, setNarrativeText] = useState("");
+  // Full-text view: for narrative documents it is the AI-extracted raw
+  // text; for structured ones it falls back to the OCR text. Editable so
+  // the user can fix it before adding to the timeline.
+  const [fullText, setFullText] = useState("");
+  // Which review view is shown. The AI decides by default; the user can
+  // override when the AI picked the wrong mode.
+  const [viewMode, setViewMode] = useState<"structured" | "narrative">(
+    "structured",
+  );
+  // On-demand split: narrative documents are NOT pre-split at upload
+  // (keeps the initial extraction fast). When the user taps 分条展示, we
+  // call the /split endpoint once and cache the facts here.
+  const [splitFacts, setSplitFacts] = useState<ExtractedFact[] | null>(null);
+  const [splitCrossCheck, setSplitCrossCheck] = useState<
+    UploadResult["cross_check"]
+  >([]);
+  const [splitting, setSplitting] = useState(false);
+  const [splitError, setSplitError] = useState("");
 
   useEffect(() => {
     if (uploadState.status !== "processing" || !uploadState.startedAt) {
@@ -1896,7 +1924,17 @@ function UploadPage({
       setEventDate(
         result.extracted_event?.event_time?.start?.slice(0, 10) ?? "",
       );
-      setNarrativeText(result.extracted_event?.narrative ?? "");
+      setFullText(
+        result.extracted_event?.narrative ?? result.artifact.ocr_text ?? "",
+      );
+      // Default to the AI's pick; the toggle lets the user override it.
+      setViewMode(
+        result.extracted_event?.narrative ? "narrative" : "structured",
+      );
+      setSplitFacts(null);
+      setSplitCrossCheck([]);
+      setSplitting(false);
+      setSplitError("");
       onUploaded();
     } catch (err) {
       setUploadState({
@@ -1930,8 +1968,10 @@ function UploadPage({
     const ev = uploadState.result?.extracted_event;
     if (!ev) return;
     setAddError("");
+    // Facts source: pre-split facts, or the on-demand /split result.
+    const srcFacts = ev.facts?.length ? ev.facts : (splitFacts ?? []);
     const facts: ExtractedFact[] = [];
-    for (const f of ev.facts) {
+    for (const f of srcFacts) {
       const r = review[f.fact_id];
       if (r?.action === "rejected") continue;
       let fact: ExtractedFact = { ...f, time: { precision: "unknown" } };
@@ -1957,8 +1997,9 @@ function UploadPage({
       ...ev,
       patient_id: session.user.patient_id,
       source_artifact_ids: [uploadState.result!.artifact.artifact_id],
-      facts,
-      narrative: ev.narrative ? narrativeText : ev.narrative,
+      // The user picks the view: split items (facts) or full text.
+      facts: viewMode === "narrative" ? [] : facts,
+      narrative: viewMode === "narrative" ? fullText : undefined,
       // Timeline sorts by the document date, not upload time: keep the
       // OCR-recognized date unless the user changed/cleared it, and let
       // the user fill in the date when the image had no recognizable one.
@@ -2121,48 +2162,136 @@ function UploadPage({
           {status === "processing" && (
             <p>正在分析图片，请稍候…</p>
           )}
-          {status === "complete" && uploadState.result && (
-            uploadState.result.extracted_event?.facts?.length ? (
-              <FactReviewPanel
-                event={uploadState.result.extracted_event}
-                ocrText={uploadState.result.artifact.ocr_text}
-                crossCheck={uploadState.result.cross_check ?? []}
-                review={review}
-                setReview={setReview}
-                editingFactId={editingFactId}
-                setEditingFactId={setEditingFactId}
-                editValue={editValue}
-                setEditValue={setEditValue}
-                extraFacts={extraFacts}
-                setExtraFacts={setExtraFacts}
-              />
-            ) : uploadState.result.extracted_event?.narrative ? (
-              <div className="ocr-result">
-                <div className="ocr-meta">
-                  <span>
-                    引擎：{uploadState.result.artifact.ocr_engine ?? "—"}
-                  </span>
-                  <span>状态：{uploadState.result.status}</span>
+          {status === "complete" && uploadState.result && (() => {
+            const ev = uploadState.result.extracted_event;
+            const hasFacts = !!ev?.facts?.length;
+            const hasNarrative = !!ev?.narrative;
+            if (hasFacts || hasNarrative) {
+              // Facts shown in the split view: pre-split for structured
+              // documents, or the on-demand /split result for narratives.
+              const displayFacts = hasFacts
+                ? ev!.facts
+                : (splitFacts ?? []);
+              const displayCrossCheck = hasFacts
+                ? (uploadState.result.cross_check ?? [])
+                : splitCrossCheck;
+              return (
+                <div className="review-views">
+                  <div className="view-toggle">
+                    <button
+                      type="button"
+                      className={viewMode === "structured" ? "active" : ""}
+                      onClick={() => {
+                        setSplitError("");
+                        setViewMode("structured");
+                        // Narrative docs are not pre-split (keeps upload
+                        // fast); split on demand the first time the user
+                        // asks for the split view.
+                        const cur = uploadState.result?.extracted_event;
+                        if (
+                          cur &&
+                          !cur.facts?.length &&
+                          splitFacts === null &&
+                          !splitting
+                        ) {
+                          setSplitting(true);
+                          void splitDocument(
+                            session.user.patient_id,
+                            uploadState.result!.artifact.artifact_id,
+                            session.token,
+                          )
+                            .then((r) => {
+                              setSplitFacts(r.facts);
+                              setSplitCrossCheck(r.cross_check ?? []);
+                            })
+                            .catch((err) =>
+                              setSplitError(
+                                err instanceof Error ? err.message : "分条失败",
+                              ),
+                            )
+                            .finally(() => setSplitting(false));
+                        }
+                      }}
+                    >
+                      {splitting ? "正在分条…" : "分条展示"}
+                    </button>
+                    <button
+                      type="button"
+                      className={viewMode === "narrative" ? "active" : ""}
+                      onClick={() => setViewMode("narrative")}
+                    >
+                      全部展示
+                    </button>
+                    <span className="view-toggle-hint">
+                      AI 自动判断，可手动切换（如识别不准）
+                    </span>
+                  </div>
+                  {viewMode === "structured" ? (
+                    displayFacts.length > 0 ? (
+                      <FactReviewPanel
+                        event={{ ...ev!, facts: displayFacts }}
+                        ocrText={uploadState.result.artifact.ocr_text}
+                        crossCheck={displayCrossCheck}
+                        review={review}
+                        setReview={setReview}
+                        editingFactId={editingFactId}
+                        setEditingFactId={setEditingFactId}
+                        editValue={editValue}
+                        setEditValue={setEditValue}
+                        extraFacts={extraFacts}
+                        setExtraFacts={setExtraFacts}
+                      />
+                    ) : (
+                      <div className="ocr-result">
+                        {splitting ? (
+                          <p className="no-facts-hint">
+                            正在按你的要求分条提取，请稍候…
+                          </p>
+                        ) : splitError ? (
+                          <p className="add-error">分条失败：{splitError}</p>
+                        ) : (
+                          <p className="no-facts-hint">
+                            该文档未提取到可分条的项目，可在「全部展示」中查看并编辑原文
+                          </p>
+                        )}
+                      </div>
+                    )
+                  ) : (
+                    <div className="ocr-result">
+                      <div className="ocr-meta">
+                        <span>
+                          引擎：{uploadState.result.artifact.ocr_engine ?? "—"}
+                        </span>
+                        <span>状态：{uploadState.result.status}</span>
+                      </div>
+                      <p className="no-facts-hint">
+                        以下是按原文顺序提取的完整文字，可直接编辑，核对后加入时间轴
+                      </p>
+                      <textarea
+                        className="narrative-edit"
+                        rows={14}
+                        value={fullText}
+                        onChange={(e) => setFullText(e.target.value)}
+                        placeholder="（原文）"
+                      />
+                    </div>
+                  )}
                 </div>
-                <p className="no-facts-hint">
-                  识别为叙述性文档（如出院记录），AI 判断不分条：以下是按原文顺序提取的完整文字，可直接编辑，核对后加入时间轴
-                </p>
-                <textarea
-                  className="narrative-edit"
-                  rows={14}
-                  value={narrativeText}
-                  onChange={(e) => setNarrativeText(e.target.value)}
-                  placeholder="（原文）"
-                />
-              </div>
-            ) : uploadState.result.artifact.document_type === "imaging" &&
-              !uploadState.result.artifact.ocr_text ? (
-              <div className="ocr-result">
-                <p className="no-facts-hint">
-                  检测为影像原图：未识别到文字，原图已保存。确认后点击「加入时间轴」，会同时出现在时间轴的「全部」和「影像」板块。
-                </p>
-              </div>
-            ) : (
+              );
+            }
+            if (
+              uploadState.result.artifact.document_type === "imaging" &&
+              !uploadState.result.artifact.ocr_text
+            ) {
+              return (
+                <div className="ocr-result">
+                  <p className="no-facts-hint">
+                    检测为影像原图：未识别到文字，原图已保存。确认后点击「加入时间轴」，会同时出现在时间轴的「全部」和「影像」板块。
+                  </p>
+                </div>
+              );
+            }
+            return (
               <div className="ocr-result">
                 <div className="ocr-meta">
                   <span>
@@ -2180,8 +2309,8 @@ function UploadPage({
                   {uploadState.result.artifact.ocr_text || "（未识别到文字）"}
                 </pre>
               </div>
-            )
-          )}
+            );
+          })()}
           {status === "offline" && <p>{message ?? "处理失败，请重试"}</p>}
         </article>
       </div>
@@ -2262,7 +2391,71 @@ function AssistantPage({
     next: AssistantState | ((prev: AssistantState) => AssistantState),
   ) => void;
 }) {
-  const { messages, question, busy, error, contextPreview } = assistantState;
+  const { messages, question, busy, error, contextPreview, conversationId, conversations, searchQuery, loadingConversations } = assistantState;
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // 加载对话列表
+  async function refreshConversations() {
+    setAssistantState((prev) => ({ ...prev, loadingConversations: true }));
+    try {
+      const list = await listConversations(session.user.patient_id, session.token, searchQuery);
+      setAssistantState((prev) => ({ ...prev, conversations: list, loadingConversations: false }));
+    } catch {
+      setAssistantState((prev) => ({ ...prev, loadingConversations: false }));
+    }
+  }
+
+  useEffect(() => {
+    void refreshConversations();
+  }, [searchQuery]);
+
+  // 自动滚动到底部
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
+
+  async function selectConversation(convId: string) {
+    if (busy) return;
+    try {
+      const detail = await getConversation(session.user.patient_id, session.token, convId);
+      setAssistantState((prev) => ({
+        ...prev,
+        conversationId: convId,
+        messages: detail.messages,
+        question: "",
+        error: null,
+        contextPreview: null,
+      }));
+    } catch (err) {
+      setAssistantState((prev) => ({ ...prev, error: err instanceof Error ? err.message : "加载对话失败" }));
+    }
+  }
+
+  function newChat() {
+    if (busy) return;
+    setAssistantState((prev) => ({
+      ...prev,
+      conversationId: null,
+      messages: [],
+      question: "",
+      error: null,
+      contextPreview: null,
+    }));
+  }
+
+  async function handleDeleteConversation(convId: string, e: React.MouseEvent) {
+    e.stopPropagation();
+    if (!window.confirm("确定删除这个对话？")) return;
+    try {
+      await deleteConversation(session.user.patient_id, session.token, convId);
+      if (conversationId === convId) {
+        newChat();
+      }
+      void refreshConversations();
+    } catch (err) {
+      setAssistantState((prev) => ({ ...prev, error: err instanceof Error ? err.message : "删除失败" }));
+    }
+  }
 
   const observations = events.flatMap((event) =>
     event.facts.map((fact) => ({
@@ -2272,38 +2465,6 @@ function AssistantPage({
       id: fact.id,
     })),
   );
-
-  async function handleAnalyze() {
-    setAssistantState((prev) => ({
-      ...prev,
-      busy: true,
-      error: null,
-    }));
-    try {
-      const reply = await runHealthAnalysis(
-        session.user.patient_id,
-        session.token,
-      );
-      setAssistantState((prev) => ({
-        ...prev,
-        busy: false,
-        contextPreview: reply.context ?? null,
-        messages: [
-          ...prev.messages,
-          {
-            role: "assistant",
-            content: reply.answer,
-          },
-        ],
-      }));
-    } catch (err) {
-      setAssistantState((prev) => ({
-        ...prev,
-        busy: false,
-        error: err instanceof Error ? err.message : "分析失败",
-      }));
-    }
-  }
 
   async function handleAsk(event: FormEvent) {
     event.preventDefault();
@@ -2323,16 +2484,22 @@ function AssistantPage({
         session.token,
         text,
         history,
+        conversationId,
       );
       setAssistantState((prev) => ({
         ...prev,
         busy: false,
         contextPreview: reply.context ?? null,
+        conversationId: reply.conversation_id ?? prev.conversationId,
         messages: [
           ...prev.messages,
           { role: "assistant", content: reply.answer },
         ],
       }));
+      // 新对话发完后刷新列表
+      if (!conversationId && reply.conversation_id) {
+        void refreshConversations();
+      }
     } catch (err) {
       setAssistantState((prev) => ({
         ...prev,
@@ -2363,96 +2530,67 @@ function AssistantPage({
     );
   }
 
-  const previewObservations =
-    contextPreview?.observations?.slice(0, 8) ??
-    observations.slice(0, 8).map((item) => ({
-      time: item.date,
-      concept: item.label,
-      value: { type: "text", text: item.value },
-    }));
-
   return (
     <section className="page-stack">
       <div className="section-title">
         <div>
           <span className="eyebrow">AI 助手</span>
-          <h1>基于结构化时间轴做健康分析</h1>
-          <p>
-            点击「健康分析」读取后台 Agent Context；也可以继续追问交互。
-          </p>
+          <h1>健康咨询</h1>
         </div>
-        <button
-          className="primary-button"
-          type="button"
-          onClick={() => void handleAnalyze()}
-          disabled={busy}
-        >
-          {busy ? "分析中..." : "健康分析"}
-        </button>
       </div>
 
-      <div className="assistant-grid">
-        <article className="panel context-card">
-          <div className="panel-head compact">
-            <div>
-              <span className="eyebrow">Agent Context</span>
-              <h2>高效结构化上下文</h2>
-            </div>
-            <span className="context-range">{events.length} 条事件</span>
+      <div className="assistant-layout">
+        {/* 左侧对话列表 */}
+        <aside className="conv-sidebar">
+          <div className="conv-sidebar-head">
+            <input
+              className="conv-search"
+              type="text"
+              placeholder="搜索对话..."
+              value={searchQuery}
+              onChange={(e) =>
+                setAssistantState((prev) => ({ ...prev, searchQuery: e.target.value }))
+              }
+            />
+            <button className="primary-button conv-new-btn" type="button" onClick={newChat} disabled={busy}>
+              + 新对话
+            </button>
           </div>
-
-          <div className="context-section">
-            <span className="context-label">OBSERVATIONS</span>
-            {previewObservations.length === 0 ? (
-              <p className="empty-copy">暂无结构化指标。</p>
+          <div className="conv-list">
+            {loadingConversations ? (
+              <p className="empty-copy">加载中...</p>
+            ) : conversations.length === 0 ? (
+              <p className="empty-copy">暂无历史对话</p>
             ) : (
-              previewObservations.map((fact, index) => {
-                const value = fact.value as
-                  | {
-                      type?: string;
-                      number?: number;
-                      unit?: string;
-                      text?: string;
-                    }
-                  | null
-                  | undefined;
-                let display = "-";
-                if (value?.type === "quantity" && value.number != null) {
-                  display = `${value.number}${value.unit ? ` ${value.unit}` : ""}`;
-                } else if (value?.text) {
-                  display = value.text;
-                }
-                return (
-                  <div className="context-row" key={`${fact.concept}-${index}`}>
-                    <span>{String(fact.time ?? "").slice(0, 10)}</span>
-                    <strong>{fact.concept}</strong>
-                    <span>{display}</span>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          <div className="context-section">
-            <span className="context-label">DATA GAPS</span>
-            {(contextPreview?.data_gaps ?? ["点击健康分析后显示缺口"]).map(
-              (gap) => (
-                <div className="gap-row" key={gap}>
-                  {gap}
+              conversations.map((conv) => (
+                <div
+                  key={conv.conversation_id}
+                  className={`conv-item ${conversationId === conv.conversation_id ? "active" : ""}`}
+                  onClick={() => void selectConversation(conv.conversation_id)}
+                >
+                  <div className="conv-item-title">{conv.title}</div>
+                  <div className="conv-item-preview">{conv.preview || " "}</div>
+                  <button
+                    className="conv-delete"
+                    onClick={(e) => void handleDeleteConversation(conv.conversation_id, e)}
+                    title="删除对话"
+                  >
+                    ×
+                  </button>
                 </div>
-              ),
+              ))
             )}
           </div>
-        </article>
+        </aside>
 
+        {/* 右侧聊天区 */}
         <article className="assistant-answer assistant-chat">
-          <span className="assistant-badge">交互分析</span>
           <div className="chat-log">
             {messages.length === 0 ? (
-              <p>
+              <p className="empty-copy" style={{ padding: 40, textAlign: "center" }}>
                 {busy
-                  ? "正在分析你的健康数据，切换页面也不会中断，稍后再回来即可查看结果。"
-                  : "先点右上角「健康分析」，系统会读取你的结构化时间轴并给出总结。之后可以继续提问，例如：“肌酐最近有什么变化？”"}
+                  ? "正在生成回复..."
+                  : "输入问题开始对话，例如：我的肝功能指标怎么样？"}
               </p>
             ) : (
               messages.map((turn, index) => (
@@ -2473,9 +2611,8 @@ function AssistantPage({
                 </div>
               ))
             )}
-            {busy && messages.length > 0 && (
-              <p className="empty-copy">正在生成回复...</p>
-            )}
+            {busy && <p className="empty-copy">正在生成回复...</p>}
+            <div ref={chatEndRef} />
           </div>
 
           {error && <p className="auth-error">{error}</p>}
@@ -2489,7 +2626,7 @@ function AssistantPage({
                   question: e.target.value,
                 }))
               }
-              placeholder="继续提问，例如：有哪些数据缺口？"
+              placeholder="输入你的问题..."
               disabled={busy}
             />
             <button className="primary-button" type="submit" disabled={busy}>

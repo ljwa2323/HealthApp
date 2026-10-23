@@ -242,6 +242,28 @@ export async function uploadHealthRecord(
   return response.json();
 }
 
+export type SplitResult = {
+  event: ExtractedEvent;
+  facts: ExtractedFact[];
+  cross_check: UploadResult["cross_check"];
+};
+
+export async function splitDocument(
+  patientId: string,
+  artifactId: string,
+  token: string,
+): Promise<SplitResult> {
+  const response = await fetch(
+    `${API_BASE}/api/patients/${patientId}/documents/${artifactId}/split`,
+    {
+      method: "POST",
+      headers: authHeaders(token),
+    },
+  );
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
+}
+
 export async function fetchTimeline(
   patientId: string,
   token: string,
@@ -352,9 +374,62 @@ export type AssistantReply = {
     }>;
     events?: Array<{ title?: string; time?: string | null; type?: string }>;
     data_gaps?: string[];
+    data_quality_issues?: string[];
     evidence_refs?: string[];
   } | null;
+  conversation_id?: string | null;
 };
+
+export type ConversationSummary = {
+  conversation_id: string;
+  title: string;
+  preview: string;
+  updated_at: string;
+};
+
+export type ConversationDetail = {
+  conversation_id: string;
+  title: string;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+};
+
+export async function listConversations(
+  patientId: string,
+  token: string,
+  search = "",
+): Promise<ConversationSummary[]> {
+  const url = new URL(`${API_BASE}/api/patients/${patientId}/conversations`);
+  if (search) url.searchParams.set("q", search);
+  const res = await fetch(url.toString(), { headers: authHeaders(token) });
+  if (!res.ok) throw new Error(await readError(res));
+  const data = await res.json();
+  return data.conversations ?? [];
+}
+
+export async function getConversation(
+  patientId: string,
+  token: string,
+  conversationId: string,
+): Promise<ConversationDetail> {
+  const res = await fetch(
+    `${API_BASE}/api/patients/${patientId}/conversations/${conversationId}`,
+    { headers: authHeaders(token) },
+  );
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
+export async function deleteConversation(
+  patientId: string,
+  token: string,
+  conversationId: string,
+): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/api/patients/${patientId}/conversations/${conversationId}`,
+    { method: "DELETE", headers: authHeaders(token) },
+  );
+  if (!res.ok) throw new Error(await readError(res));
+}
 
 export async function runHealthAnalysis(
   patientId: string,
@@ -380,6 +455,7 @@ export async function askHealthAssistant(
   token: string,
   question: string,
   history: Array<{ role: "user" | "assistant"; content: string }>,
+  conversationId?: string | null,
 ): Promise<AssistantReply> {
   const response = await fetch(
     `${API_BASE}/api/patients/${patientId}/assistant/chat`,
@@ -393,6 +469,7 @@ export async function askHealthAssistant(
         question,
         history,
         task: "general_longitudinal_review",
+        conversation_id: conversationId ?? null,
       }),
     },
   );

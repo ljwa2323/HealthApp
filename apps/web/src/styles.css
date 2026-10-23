@@ -1217,6 +1217,41 @@ main {
   min-height: 180px;
 }
 
+.review-views {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.view-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.view-toggle button {
+  padding: 5px 14px;
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  background: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  color: #4b5563;
+  cursor: pointer;
+}
+
+.view-toggle button.active {
+  background: #1f6f5c;
+  border-color: #1f6f5c;
+  color: #fff;
+}
+
+.view-toggle-hint {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
 .narrative-edit:focus {
   outline: none;
   border-color: #a86e3b;
@@ -1780,6 +1815,109 @@ main {
   align-items: stretch;
 }
 
+.assistant-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  align-items: stretch;
+  min-height: 60vh;
+}
+
+.conv-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border-right: 1px solid #e2e8e4;
+  padding-right: 14px;
+}
+
+.conv-sidebar-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.conv-search {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #d0d8d4;
+  border-radius: 8px;
+  font-size: 13px;
+  background: #f7faf8;
+}
+
+.conv-new-btn {
+  white-space: nowrap;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.conv-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 60vh;
+}
+
+.conv-item {
+  position: relative;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.15s;
+}
+
+.conv-item:hover {
+  background: #f0f5f2;
+}
+
+.conv-item.active {
+  background: #e6f0eb;
+  border-color: #b8d4c6;
+}
+
+.conv-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #2c3e36;
+  margin-bottom: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 20px;
+}
+
+.conv-item-preview {
+  font-size: 11px;
+  color: #7a8a82;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: #b0b8b4;
+  font-size: 14px;
+  cursor: pointer;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.conv-delete:hover {
+  color: #d04545;
+  background: #fbeaea;
+}
+
 .context-range {
   padding: 7px 10px;
   border-radius: 9px;
@@ -2076,8 +2214,20 @@ main {
 
   .two-column,
   .upload-layout,
-  .assistant-grid {
+  .assistant-grid,
+  .assistant-layout {
     grid-template-columns: 1fr;
+  }
+
+  .conv-sidebar {
+    border-right: none;
+    border-bottom: 1px solid #e2e8e4;
+    padding-right: 0;
+    padding-bottom: 10px;
+  }
+
+  .conv-list {
+    max-height: 200px;
   }
 
   .timeline-list {
