@@ -23,6 +23,7 @@ returns None and the caller keeps the plain linear text path.
 """
 from __future__ import annotations
 
+import re
 import statistics
 from typing import Any
 
@@ -44,15 +45,51 @@ class TableGrid:
     def cell_text(self, row: int, col: int) -> str:
         return " ".join(self.cells.get((row, col), [])).strip()
 
+    # Axis-scale tick rows: on vital-signs sheets the left column is the
+    # chart's Y axis (pulse 180..20, temperature 42°..34°), one tick per
+    # row. Each such row holds a single cell whose text is only numbers
+    # ("180 42", "160 41°"), and the leading numbers run strictly
+    # monotonic down the sheet. These are layout ticks, not recorded data.
+    _AXIS_TEXT = re.compile(r"^\d{1,4}(?:\s*\d{1,4}°?)?$")
+
+    def _axis_rows(self) -> set[int]:
+        candidates: list[tuple[int, float]] = []
+        for r in range(len(self.rows)):
+            filled = [
+                (c, self.cell_text(r, c))
+                for c in range(len(self.columns))
+                if self.cell_text(r, c)
+            ]
+            if len(filled) != 1:
+                continue
+            text = filled[0][1]
+            if not self._AXIS_TEXT.match(text):
+                continue
+            first_num = re.match(r"(\d+)", text)
+            if not first_num:
+                continue
+            candidates.append((r, float(first_num.group(1))))
+        if len(candidates) < 3:
+            return set()
+        firsts = [v for _, v in candidates]
+        monotonic = all(b < a for (a, b) in zip(firsts, firsts[1:])) or all(
+            b > a for (a, b) in zip(firsts, firsts[1:])
+        )
+        if not monotonic:
+            return set()
+        return {r for r, _ in candidates}
+
     def to_text(self) -> str:
         """Render the grid as a readable row/column table for the model."""
+        axis_rows = self._axis_rows()
         lines: list[str] = []
         for r in range(len(self.rows)):
             cells = [
                 self.cell_text(r, c) or "-"
                 for c in range(len(self.columns))
             ]
-            lines.append(f"第{r + 1}行: " + " | ".join(cells))
+            marker = "【轴刻度行，非数据】" if r in axis_rows else ""
+            lines.append(f"第{r + 1}行{marker}: " + " | ".join(cells))
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
