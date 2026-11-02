@@ -52,6 +52,8 @@ export type ExtractedEvent = {
   institution?: string | null;
   summary?: string | null;
   narrative?: string | null;
+  // Reconstructed multi-column table (row-major cells) for the table view.
+  grid?: string[][] | null;
   facts: ExtractedFact[];
   patient_id?: string;
   source_artifact_ids?: string[];
@@ -97,6 +99,7 @@ export type TimelineEventApi = {
   institution?: string | null;
   summary?: string | null;
   source_artifact_ids?: string[];
+  grid?: string[][] | null;
   facts: Array<{
     fact_id: string;
     concept: { display: string };
@@ -475,4 +478,101 @@ export async function askHealthAssistant(
   );
   if (!response.ok) throw new Error(await readError(response));
   return (await response.json()) as AssistantReply;
+}
+
+export type StreamEvent = {
+  type: string;
+  text?: string;
+  answer?: string;
+  confidence?: number;
+  conversation_id?: string | null;
+  context?: AssistantReply["context"] | null;
+  used_fact_ids?: string[];
+  detail?: string;
+};
+
+export type StreamResult = {
+  answer: string;
+  conversation_id: string | null;
+  context: AssistantReply["context"] | null;
+  used_fact_ids: string[];
+  confidence: number | null;
+};
+
+export async function askHealthAssistantStream(
+  patientId: string,
+  token: string,
+  question: string,
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+  conversationId?: string | null,
+  onChunk?: (text: string) => void,
+): Promise<StreamResult> {
+  const response = await fetch(
+    `${API_BASE}/api/patients/${patientId}/assistant/chat/stream`,
+    {
+      method: "POST",
+      headers: {
+        ...authHeaders(token),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        question,
+        history,
+        task: "general_longitudinal_review",
+        conversation_id: conversationId ?? null,
+      }),
+    },
+  );
+  if (!response.ok || !response.body) throw new Error(await readError(response));
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let answer = "";
+  let conversationIdResult: string | null = null;
+  let context: AssistantReply["context"] | null = null;
+  let usedFactIds: string[] = [];
+  let confidence: number | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.trim();
+      if (!line.startsWith("data:")) continue;
+      const jsonText = line.slice(5).trim();
+      if (!jsonText) continue;
+      let event: StreamEvent;
+      try {
+        event = JSON.parse(jsonText) as StreamEvent;
+      } catch {
+        continue;
+      }
+      if (event.type === "meta") {
+        conversationIdResult = event.conversation_id ?? conversationIdResult;
+        context = event.context ?? null;
+        usedFactIds = event.used_fact_ids ?? [];
+      } else if (event.type === "chunk") {
+        answer += event.text ?? "";
+        onChunk?.(event.text ?? "");
+      } else if (event.type === "done") {
+        answer = event.answer ?? answer;
+        confidence = event.confidence ?? null;
+        conversationIdResult = event.conversation_id ?? conversationIdResult;
+      } else if (event.type === "error") {
+        throw new Error(event.detail ?? "流式回答失败");
+      }
+    }
+  }
+
+  return {
+    answer,
+    conversation_id: conversationIdResult,
+    context,
+    used_fact_ids: usedFactIds,
+    confidence,
+  };
 }

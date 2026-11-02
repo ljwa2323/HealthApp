@@ -4,7 +4,7 @@ import Markdown from "react-markdown";
 import {
   AuthResponse,
   AuthUser,
-  askHealthAssistant,
+  askHealthAssistantStream,
   AssistantReply,
   changePassword,
   clearSession,
@@ -258,8 +258,8 @@ function mapApiEvent(event: TimelineEventApi): TimelineEvent {
       event.source_artifact_ids?.[0] ||
       event.facts?.[0]?.evidence?.[0]?.artifact_id ||
       undefined,
-    facts: (event.facts ?? []).map((fact) => {
-      const value = fact.value;
+    grid: event.grid ?? undefined,
+    facts: (event.facts ?? []).map((fact) => {      const value = fact.value;
       let display = "-";
       if (value?.type === "quantity" && value.number != null) {
         display = `${value.number}${value.unit ? ` ${value.unit}` : ""}`;
@@ -511,6 +511,28 @@ function EventCard({
         <div className="event-detail">
           {!editing ? (
             <>
+              {event.grid && (
+                <div className="grid-review">
+                  <div className="grid-table-wrap">
+                    <table className="grid-table grid-table-readonly">
+                      <tbody>
+                        {event.grid.map((row, r) => (
+                          <tr key={r}>
+                            <td className="grid-row-index">{r + 1}</td>
+                            {row.map((cell, c) => (
+                              <td key={c}>
+                                <span className="grid-cell-text">
+                                  {cell || "-"}
+                                </span>
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
               <div className="fact-list">
                 {event.facts.map((fact) => (
                   <div className="fact-row" key={fact.id}>
@@ -1796,6 +1818,50 @@ function FactReviewPanel({
   );
 }
 
+// Table review view: the reconstructed multi-column grid (row-major cell
+// matrix from table_grid.py) rendered as an editable table. Every cell is
+// an input so the user can fix OCR errors before adding to the timeline.
+function GridReviewPanel({
+  grid,
+  onGridChange,
+}: {
+  grid: string[][];
+  onGridChange: (matrix: string[][]) => void;
+}) {
+  const colCount = grid.length ? grid[0].length : 0;
+  return (
+    <div className="grid-review">
+      <p className="no-facts-hint">
+        检测到多列表格，已按行列重建。可直接编辑每个格子，核对后加入时间轴
+      </p>
+      <div className="grid-table-wrap">
+        <table className="grid-table">
+          <tbody>
+            {grid.map((row, r) => (
+              <tr key={r}>
+                <td className="grid-row-index">{r + 1}</td>
+                {Array.from({ length: colCount }, (_, c) => (
+                  <td key={c}>
+                    <input
+                      value={row[c] ?? ""}
+                      placeholder="-"
+                      onChange={(e) => {
+                        const next = grid.map((rr) => [...rr]);
+                        next[r][c] = e.target.value;
+                        onGridChange(next);
+                      }}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function UploadPage({
   session,
   uploadState,
@@ -1832,10 +1898,14 @@ function UploadPage({
   // the user can fix it before adding to the timeline.
   const [fullText, setFullText] = useState("");
   // Which review view is shown. The AI decides by default; the user can
-  // override when the AI picked the wrong mode.
-  const [viewMode, setViewMode] = useState<"structured" | "narrative">(
+  // override when the AI picked the wrong mode. Three shapes: 分条展示
+  // (facts), 表格展示 (reconstructed multi-column grid), 全部展示 (raw text).
+  const [viewMode, setViewMode] = useState<"structured" | "narrative" | "grid">(
     "structured",
   );
+  // Editable copy of the reconstructed table (row-major matrix). Null when
+  // the document had no tabular layout.
+  const [gridEdits, setGridEdits] = useState<string[][] | null>(null);
   // On-demand split: narrative documents are NOT pre-split at upload
   // (keeps the initial extraction fast). When the user taps 分条展示, we
   // call the /split endpoint once and cache the facts here.
@@ -1928,8 +1998,18 @@ function UploadPage({
         result.extracted_event?.narrative ?? result.artifact.ocr_text ?? "",
       );
       // Default to the AI's pick; the toggle lets the user override it.
+      // Tabular layouts get the grid view by default.
       setViewMode(
-        result.extracted_event?.narrative ? "narrative" : "structured",
+        result.extracted_event?.grid
+          ? "grid"
+          : result.extracted_event?.narrative
+            ? "narrative"
+            : "structured",
+      );
+      setGridEdits(
+        result.extracted_event?.grid
+          ? result.extracted_event.grid.map((row) => [...row])
+          : null,
       );
       setSplitFacts(null);
       setSplitCrossCheck([]);
@@ -1997,9 +2077,11 @@ function UploadPage({
       ...ev,
       patient_id: session.user.patient_id,
       source_artifact_ids: [uploadState.result!.artifact.artifact_id],
-      // The user picks the view: split items (facts) or full text.
-      facts: viewMode === "narrative" ? [] : facts,
+      // The user picks the view: split items (facts), the table grid, or
+      // the full text. Only the chosen shape is written to the timeline.
+      facts: viewMode === "narrative" || viewMode === "grid" ? [] : facts,
       narrative: viewMode === "narrative" ? fullText : undefined,
+      grid: viewMode === "grid" ? gridEdits : undefined,
       // Timeline sorts by the document date, not upload time: keep the
       // OCR-recognized date unless the user changed/cleared it, and let
       // the user fill in the date when the image had no recognizable one.
@@ -2178,6 +2260,15 @@ function UploadPage({
               return (
                 <div className="review-views">
                   <div className="view-toggle">
+                    {ev?.grid && (
+                      <button
+                        type="button"
+                        className={viewMode === "grid" ? "active" : ""}
+                        onClick={() => setViewMode("grid")}
+                      >
+                        表格展示
+                      </button>
+                    )}
                     <button
                       type="button"
                       className={viewMode === "structured" ? "active" : ""}
@@ -2226,7 +2317,12 @@ function UploadPage({
                       AI 自动判断，可手动切换（如识别不准）
                     </span>
                   </div>
-                  {viewMode === "structured" ? (
+                  {viewMode === "grid" && ev?.grid ? (
+                    <GridReviewPanel
+                      grid={gridEdits ?? ev.grid}
+                      onGridChange={setGridEdits}
+                    />
+                  ) : viewMode === "structured" ? (
                     displayFacts.length > 0 ? (
                       <FactReviewPanel
                         event={{ ...ev!, facts: displayFacts }}
@@ -2476,36 +2572,72 @@ function AssistantPage({
       question: "",
       busy: true,
       error: null,
-      messages: [...prev.messages, { role: "user", content: text }],
+      messages: [
+        ...prev.messages,
+        { role: "user", content: text },
+        { role: "assistant", content: "" },
+      ],
     }));
     try {
-      const reply = await askHealthAssistant(
+      const result = await askHealthAssistantStream(
         session.user.patient_id,
         session.token,
         text,
         history,
         conversationId,
+        (chunk) => {
+          setAssistantState((prev) => {
+            const msgs = [...prev.messages];
+            const last = msgs.length - 1;
+            if (last >= 0 && msgs[last].role === "assistant") {
+              msgs[last] = {
+                role: "assistant",
+                content: msgs[last].content + chunk,
+              };
+            }
+            return { ...prev, messages: msgs };
+          });
+        },
       );
-      setAssistantState((prev) => ({
-        ...prev,
-        busy: false,
-        contextPreview: reply.context ?? null,
-        conversationId: reply.conversation_id ?? prev.conversationId,
-        messages: [
-          ...prev.messages,
-          { role: "assistant", content: reply.answer },
-        ],
-      }));
+      setAssistantState((prev) => {
+        const msgs = [...prev.messages];
+        const last = msgs.length - 1;
+        if (
+          last >= 0 &&
+          msgs[last].role === "assistant" &&
+          msgs[last].content === ""
+        ) {
+          msgs[last] = { role: "assistant", content: result.answer };
+        }
+        return {
+          ...prev,
+          busy: false,
+          contextPreview: result.context ?? null,
+          conversationId: result.conversation_id ?? prev.conversationId,
+          messages: msgs,
+        };
+      });
       // 新对话发完后刷新列表
-      if (!conversationId && reply.conversation_id) {
+      if (!conversationId && result.conversation_id) {
         void refreshConversations();
       }
     } catch (err) {
-      setAssistantState((prev) => ({
-        ...prev,
-        busy: false,
-        error: err instanceof Error ? err.message : "提问失败",
-      }));
+      setAssistantState((prev) => {
+        const msgs = prev.messages.filter(
+          (msg, index) =>
+            !(
+              index === prev.messages.length - 1 &&
+              msg.role === "assistant" &&
+              msg.content === ""
+            ),
+        );
+        return {
+          ...prev,
+          busy: false,
+          messages: msgs,
+          error: err instanceof Error ? err.message : "提问失败",
+        };
+      });
     }
   }
 

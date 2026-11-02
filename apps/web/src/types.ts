@@ -27,6 +27,7 @@ export type TimelineEvent = {
   institution: string;
   summary: string;
   facts: Fact[];
+  grid?: string[][];
   source: string;
   artifactId?: string;
 };

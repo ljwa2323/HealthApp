@@ -142,6 +142,7 @@ async def ingest_document(
     # hand over the reconstructed table grid (if the layout is tabular) so
     # multi-column tables are extracted per-cell instead of scrambled.
     table_text: str | None = None
+    grid_matrix: list[list[str]] | None = None
     if hasattr(normalizer, "normalize_image"):
         try:
             from .table_grid import reconstruct_grid
@@ -149,11 +150,16 @@ async def ingest_document(
             grid = reconstruct_grid(artifact.ocr_blocks)
             if grid is not None:
                 table_text = grid.to_text()
+                grid_matrix = grid.to_matrix()
         except Exception:  # noqa: BLE001 - grid is advisory
             table_text = None
         event = await normalizer.normalize_image(
             patient_id, artifact, content, table_text=table_text
         )
+        # Tabular layouts ship the grid to the frontend as a third review
+        # mode (分条 / 表格 / 全部) alongside facts and narrative.
+        if event is not None and grid_matrix:
+            event.grid = grid_matrix
     else:
         event = await normalizer.normalize(patient_id, artifact, ocr)
 

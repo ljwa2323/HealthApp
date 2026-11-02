@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -27,6 +29,7 @@ from .services.auth_store import UserRecord, get_store
 from .services.context_builder import build_agent_context
 from .services.health_assistant import answer_question, answer_question_stream
 from .services.ingestion import ingest_document
+from .services.intent_router import route_question
 
 app = FastAPI(
     title="HealthApp API",
@@ -331,6 +334,7 @@ async def split_document(
     # Re-run the local OCR (fast; OCR text is not persisted on the
     # artifact row) to rebuild the table grid and cross-check.
     table_text: str | None = None
+    grid_matrix: list[list[str]] | None = None
     cross_check: list[dict] = []
     ocr = None
     try:
@@ -347,6 +351,7 @@ async def split_document(
         )
         if grid is not None:
             table_text = grid.to_text()
+            grid_matrix = grid.to_matrix()
     except Exception:  # noqa: BLE001 - grid/OCR are advisory
         pass
 
@@ -362,6 +367,8 @@ async def split_document(
         raise HTTPException(status_code=502, detail=f"Split failed: {exc}") from exc
     if event is None:
         raise HTTPException(status_code=502, detail="Split failed: no result")
+    if grid_matrix:
+        event.grid = grid_matrix
 
     if ocr is not None:
         try:
@@ -514,7 +521,22 @@ async def assistant_chat(
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
-    events = get_store().list_events(user.patient_id)
+
+    # 意图路由先行：拿时间窗用于 SQL 下推，同时传给回答服务避免二次路由
+    route = await route_question(question)
+    effective_start = (
+        route.time_start - timedelta(days=7) if route.time_start else None
+    )
+    events = get_store().list_events(
+        user.patient_id,
+        time_start=effective_start,
+        time_end=route.time_end,
+    )
+    if not events:
+        # 时间窗内无数据：回退全量并清空窗口，让 LLM 说明"该时间窗无记录"
+        events = get_store().list_events(user.patient_id)
+        effective_start = None
+        route = replace(route, time_start=None)
     if not events:
         raise HTTPException(
             status_code=400,
@@ -539,6 +561,7 @@ async def assistant_chat(
             question=question,
             events=events,
             history=[item.model_dump() for item in payload.history],
+            route=replace(route, time_start=effective_start),
         )
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -563,7 +586,22 @@ async def assistant_chat_stream(
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
-    events = get_store().list_events(user.patient_id)
+
+    # 意图路由先行：拿时间窗用于 SQL 下推，同时传给回答服务避免二次路由
+    route = await route_question(question)
+    effective_start = (
+        route.time_start - timedelta(days=7) if route.time_start else None
+    )
+    events = get_store().list_events(
+        user.patient_id,
+        time_start=effective_start,
+        time_end=route.time_end,
+    )
+    if not events:
+        # 时间窗内无数据：回退全量并清空窗口，让 LLM 说明"该时间窗无记录"
+        events = get_store().list_events(user.patient_id)
+        effective_start = None
+        route = replace(route, time_start=None)
     if not events:
         raise HTTPException(
             status_code=400,
@@ -589,10 +627,11 @@ async def assistant_chat_stream(
                 question=question,
                 events=events,
                 history=[item.model_dump() for item in payload.history],
+                route=replace(route, time_start=effective_start),
             ):
                 if piece.get("type") == "chunk":
                     collected.append(piece.get("text", ""))
-                if piece.get("type") == "start":
+                if piece.get("type") == "meta":
                     piece["conversation_id"] = conv_id
                 yield f"data: {json.dumps(piece, ensure_ascii=False)}\n\n"
             full = "".join(collected)

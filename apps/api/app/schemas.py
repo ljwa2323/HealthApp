@@ -118,6 +118,10 @@ class ClinicalEvent(BaseModel):
     facts: list[ClinicalFact] = Field(default_factory=list)
     summary: str | None = None
     narrative: str | None = None
+    # Reconstructed multi-column table (row-major cell matrix) when the
+    # layout was tabular; the frontend renders it as a reviewable table
+    # instead of a flat fact list.
+    grid: list[list[str]] | None = None
 
 
 class SourceArtifact(BaseModel):

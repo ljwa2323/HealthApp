@@ -103,6 +103,27 @@ class TableGrid:
             },
         }
 
+    def to_matrix(self) -> list[list[str]] | None:
+        """Row-major matrix for the frontend table view.
+
+        Axis tick rows (chart Y-scale coordinates) are layout, not data:
+        drop them so the table only carries recorded rows. Returns None
+        when the reconstructed grid is too sparse to be useful as a table
+        (e.g. handwritten sheets whose blocks scatter across a huge empty
+        area) — the caller then keeps the fact-list view instead.
+        """
+        axis_rows = self._axis_rows()
+        matrix = [
+            [self.cell_text(r, c) or "" for c in range(len(self.columns))]
+            for r in range(len(self.rows))
+            if r not in axis_rows
+        ]
+        total = len(matrix) * len(self.columns) or 1
+        filled = sum(1 for row in matrix for cell in row if cell)
+        if filled / total < 0.25:
+            return None
+        return matrix
+
 
 def _merge_edges(edges: list[float], tol: float) -> list[float]:
     """Merge sorted boundary coordinates within tolerance into band edges."""
