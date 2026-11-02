@@ -319,6 +319,7 @@ async def split_document(
     from .services.cross_check import cross_check_facts
     from .services.nvidia_providers import GLMVisionNormalizer
     from .services.rapid_ocr_provider import RapidOCRProvider
+    from .services.table_grid import reconstruct_grid
 
     source = SourceArtifact(
         artifact_id=artifact.artifact_id,
@@ -327,22 +328,46 @@ async def split_document(
         media_type=artifact.media_type,
         storage_uri=artifact.storage_path,
     )
+    # Re-run the local OCR (fast; OCR text is not persisted on the
+    # artifact row) to rebuild the table grid and cross-check.
+    table_text: str | None = None
+    cross_check: list[dict] = []
+    ocr = None
+    try:
+        ocr = await RapidOCRProvider().recognize(content, artifact.media_type)
+        grid = reconstruct_grid(
+            [
+                {
+                    "text": b["text"],
+                    "bbox": b["bbox"],
+                    "confidence": b.get("confidence"),
+                }
+                for b in ocr.blocks
+            ]
+        )
+        if grid is not None:
+            table_text = grid.to_text()
+    except Exception:  # noqa: BLE001 - grid/OCR are advisory
+        pass
+
     try:
         event = await GLMVisionNormalizer().normalize_image(
-            user.patient_id, source, content, force_structured=True
+            user.patient_id,
+            source,
+            content,
+            force_structured=True,
+            table_text=table_text,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Split failed: {exc}") from exc
     if event is None:
         raise HTTPException(status_code=502, detail="Split failed: no result")
 
-    # Re-run the local OCR for the cross-check (fast; OCR text is not
-    # persisted on the artifact row).
-    try:
-        ocr = await RapidOCRProvider().recognize(content, artifact.media_type)
-        cross_check = cross_check_facts(ocr.text, event.facts)
-    except Exception:  # noqa: BLE001 - cross-check is advisory only
-        cross_check = []
+    if ocr is not None:
+        try:
+            cross_check = cross_check_facts(ocr.text, event.facts)
+        except Exception:  # noqa: BLE001 - cross-check is advisory only
+            cross_check = []
 
     return {
         "event": event,

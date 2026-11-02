@@ -729,7 +729,12 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/jpeg;base64,{b64}"
 
-    def _build_prompt(self, artifact: SourceArtifact, force_structured: bool = False) -> str:
+    def _build_prompt(
+        self,
+        artifact: SourceArtifact,
+        force_structured: bool = False,
+        table_text: str | None = None,
+    ) -> str:
         mode_rule = (
             "用户选择了「分条展示」：这份文档必须分条提取。即使是叙述型文字（出院记录、病程等），"
             "也要把明确的信息拆成分项 facts（诊断、日期、药名剂量、检查结论、医嘱等各成一条）；"
@@ -737,8 +742,17 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             if force_structured
             else ""
         )
+        grid_rule = (
+            "OCR 已把版面重建为行列表格（第1行从表头开始；\"-\"表示该格 OCR 未读到）：\n"
+            f"{table_text}\n"
+            "请结合原图核对，**严格按这个行列网格逐格提取**：每格对应一条数据，"
+            "列顺序必须与网格一致，不要把相邻列混在一起，也不要把多列内容概括成一条。\n"
+            if table_text
+            else ""
+        )
         return (
             mode_rule
+            + grid_rule
             + "你是医疗文档结构化助手。请直接看图，先判断这是哪一种医疗文档，再按对应规则提取。\n"
             "document_type 只可能是以下 9 种之一：\n"
             "- laboratory: 检验/化验报告（血常规、生化、尿常规、甲功、乙肝等），逐项提取 项目名/数值/单位/参考范围/高低\n"
@@ -787,6 +801,7 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         artifact: SourceArtifact,
         content: bytes,
         force_structured: bool = False,
+        table_text: str | None = None,
     ) -> ClinicalEvent | None:
         if not content:
             return None
@@ -797,7 +812,9 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                 "content": [
                     {
                         "type": "text",
-                        "text": self._build_prompt(artifact, force_structured),
+                        "text": self._build_prompt(
+                            artifact, force_structured, table_text
+                        ),
                     },
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],

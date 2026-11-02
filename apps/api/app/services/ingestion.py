@@ -138,9 +138,22 @@ async def ingest_document(
     ]
 
     # Vision normalizers read the raw image directly (bypass OCR text);
-    # text normalizers consume the OCR result.
+    # text normalizers consume the OCR result. For vision models, also
+    # hand over the reconstructed table grid (if the layout is tabular) so
+    # multi-column tables are extracted per-cell instead of scrambled.
+    table_text: str | None = None
     if hasattr(normalizer, "normalize_image"):
-        event = await normalizer.normalize_image(patient_id, artifact, content)
+        try:
+            from .table_grid import reconstruct_grid
+
+            grid = reconstruct_grid(artifact.ocr_blocks)
+            if grid is not None:
+                table_text = grid.to_text()
+        except Exception:  # noqa: BLE001 - grid is advisory
+            table_text = None
+        event = await normalizer.normalize_image(
+            patient_id, artifact, content, table_text=table_text
+        )
     else:
         event = await normalizer.normalize(patient_id, artifact, ocr)
 
