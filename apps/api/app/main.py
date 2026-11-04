@@ -335,7 +335,9 @@ async def split_document(
     # artifact row) to rebuild the table grid and cross-check.
     table_text: str | None = None
     grid_matrix: list[list[str]] | None = None
+    grid: object = None
     cross_check: list[dict] = []
+    grid_cross_check: list[dict] = []
     ocr = None
     try:
         ocr = await RapidOCRProvider().recognize(content, artifact.media_type)
@@ -362,24 +364,41 @@ async def split_document(
             content,
             force_structured=True,
             table_text=table_text,
+            require_correction=grid_matrix is not None,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Split failed: {exc}") from exc
     if event is None:
         raise HTTPException(status_code=502, detail="Split failed: no result")
-    if grid_matrix:
-        event.grid = grid_matrix
+    if grid is not None:
+        event.grid = grid.apply_corrections(event.grid) or grid_matrix
 
     if ocr is not None:
         try:
+            from .services.cross_check import (
+                cross_check_facts,
+                cross_check_grid,
+                locate_evidence,
+                medication_missing_fields,
+            )
+
+            # Same evidence pointers as the first ingestion pass, so a
+            # re-split document keeps its facts traceable to OCR blocks.
+            if event.facts:
+                locate_evidence(event.facts, ocr.blocks, artifact.artifact_id)
             cross_check = cross_check_facts(ocr.text, event.facts)
+            cross_check.extend(medication_missing_fields(event.facts))
+            if event.grid and grid_matrix:
+                grid_cross_check = cross_check_grid(grid_matrix, event.grid)
         except Exception:  # noqa: BLE001 - cross-check is advisory only
             cross_check = []
+            grid_cross_check = []
 
     return {
         "event": event,
         "facts": event.facts,
         "cross_check": cross_check,
+        "grid_cross_check": grid_cross_check,
     }
 
 

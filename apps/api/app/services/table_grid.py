@@ -35,15 +35,21 @@ class TableGrid:
         self,
         columns: list[list[float]],
         rows: list[list[float]],
-        cells: dict[tuple[int, int], list[str]],
+        cells: dict[tuple[int, int], list[tuple[float, float, str, Any]]],
     ) -> None:
         # columns: [[x0, x1], ...] left-to-right; rows: [[y0, y1], ...] top-down
         self.columns = columns
         self.rows = rows
-        self.cells = cells  # (row_idx, col_idx) -> list of cell text fragments
+        # (row_idx, col_idx) -> [(cx, cy, text, confidence), ...]; fragments
+        # keep their block position so cell_text can order them and
+        # low_confidence_matrix can flag cells sourced from weak OCR reads.
+        self.cells = cells
 
     def cell_text(self, row: int, col: int) -> str:
-        return " ".join(self.cells.get((row, col), [])).strip()
+        items = sorted(
+            self.cells.get((row, col), []), key=lambda it: (it[1], it[0])
+        )
+        return " ".join(it[2] for it in items).strip()
 
     # Axis-scale tick rows: on vital-signs sheets the left column is the
     # chart's Y axis (pulse 180..20, temperature 42°..34°), one tick per
@@ -79,6 +85,30 @@ class TableGrid:
             return set()
         return {r for r, _ in candidates}
 
+    def _title_rows(self) -> set[int]:
+        """Title rows above the header, e.g. "检验报告单" spanning the sheet.
+
+        A title row fills only a small share of the columns with a longer
+        text, unlike a header row (项目/结果/单位/参考范围) or a data row.
+        Only the first row is considered; returning an empty set when the
+        layout is too narrow to tell a title from data.
+        """
+        if len(self.rows) < 2 or len(self.columns) < 3:
+            return set()
+        filled = [
+            self.cell_text(0, c)
+            for c in range(len(self.columns))
+            if self.cell_text(0, c)
+        ]
+        if not filled:
+            return set()
+        # A header/data row fills more than half of the columns.
+        if len(filled) * 2 > len(self.columns):
+            return set()
+        if sum(len(t) for t in filled) < 4:
+            return set()
+        return {0}
+
     def to_text(self) -> str:
         """Render the grid as a readable row/column table for the model."""
         axis_rows = self._axis_rows()
@@ -113,16 +143,124 @@ class TableGrid:
         area) — the caller then keeps the fact-list view instead.
         """
         axis_rows = self._axis_rows()
+        skip = axis_rows | self._title_rows()
         matrix = [
             [self.cell_text(r, c) or "" for c in range(len(self.columns))]
             for r in range(len(self.rows))
-            if r not in axis_rows
+            if r not in skip
         ]
-        total = len(matrix) * len(self.columns) or 1
-        filled = sum(1 for row in matrix for cell in row if cell)
-        if filled / total < 0.25:
+        if not _useful_matrix(matrix, len(self.columns)):
             return None
         return matrix
+
+    def apply_corrections(
+        self, corrected: list[list[str]] | None
+    ) -> list[list[str]] | None:
+        """Take the GLM per-cell corrected matrix and normalize it.
+
+        The vision model reads the grid text and outputs a same-shape 2D
+        array with garbled cells fixed (e.g. OCR "7/6" -> "g/L"). This
+        validates the shape (must match the OCR grid), drops axis tick
+        rows, and applies the same sparsity floor as to_matrix(). Returns
+        None when the correction is malformed — the caller then keeps the
+        plain OCR matrix.
+        """
+        if not corrected or not isinstance(corrected, list):
+            return None
+        if len(corrected) != len(self.rows):
+            return None
+        ncols = len(self.columns)
+        norm: list[list[str]] = []
+        for r, row in enumerate(corrected):
+            if not isinstance(row, list):
+                return None
+            cells = [str(c).strip() for c in row[:ncols]]
+            while len(cells) < ncols:
+                cells.append("")
+            norm.append(cells)
+        axis_rows = self._axis_rows()
+        skip = axis_rows | self._title_rows()
+        matrix = [
+            row for r, row in enumerate(norm) if r not in skip
+        ]
+        if not _useful_matrix(matrix, ncols):
+            return None
+        return matrix
+
+    def low_confidence_matrix(
+        self, floor: float | None = None
+    ) -> list[list[bool]]:
+        """Per-cell weak-OCR flags, row-aligned with to_matrix().
+
+        A cell is flagged when any fragment inside it carried an OCR
+        confidence below `floor`. Rows skipped by to_matrix() (axis ticks,
+        title rows) are skipped here too, so the two matrices line up.
+        """
+        if floor is None:
+            floor = _COL_CONF_FLOOR
+        axis_rows = self._axis_rows()
+        skip = axis_rows | self._title_rows()
+        ncols = len(self.columns)
+        matrix: list[list[bool]] = []
+        for r in range(len(self.rows)):
+            if r in skip:
+                continue
+            row: list[bool] = []
+            for c in range(ncols):
+                low = False
+                for frag in self.cells.get((r, c), []):
+                    conf = frag[3] if len(frag) > 3 else None
+                    if conf is None:
+                        continue
+                    try:
+                        if float(conf) < floor:
+                            low = True
+                            break
+                    except (TypeError, ValueError):
+                        continue
+                row.append(low)
+            matrix.append(row)
+        return matrix
+
+
+_SPARSITY_FLOOR = 0.25
+# OCR confidence below this is usually garbled handwriting or noise; such
+# blocks must not shape the column bands (they create phantom columns), but
+# they still land in cells and reach the model.
+_COL_CONF_FLOOR = 0.45
+
+
+def _useful_matrix(matrix: list[list[str]], ncols: int) -> bool:
+    """Whether a grid reads as a table worth showing.
+
+    Two traps this guards against:
+    - a filled-share floor alone accepts handwritten sheets where two long
+      header texts and a garbled title pile up on a wide canvas;
+    - a pure sparsity floor rejects wide reports that legitimately leave
+      most columns empty per row.
+    So a table must first have >=3 columns carrying content on 2+ rows
+    (that is what makes a grid a grid). Above that, either the plain fill
+    floor passes, or a header row plus >=3 rows with two cells each passes
+    for genuinely wide layouts (4+ columns).
+    """
+    if not matrix:
+        return False
+    cols_ok = sum(
+        1
+        for c in range(ncols)
+        if sum(1 for row in matrix if row[c]) >= 2
+    )
+    if cols_ok < 3:
+        return False
+    total = len(matrix) * ncols or 1
+    filled = sum(1 for row in matrix for cell in row if cell)
+    if filled / total >= _SPARSITY_FLOOR:
+        return True
+    if ncols < 4:
+        return False
+    rows_ok = sum(1 for row in matrix if sum(1 for cell in row if cell) >= 2)
+    header_ok = sum(1 for cell in matrix[0] if cell) >= 2
+    return header_ok and rows_ok >= 3
 
 
 def _merge_edges(edges: list[float], tol: float) -> list[float]:
@@ -195,14 +333,9 @@ def _columns_from_edges(items: list[dict[str, Any]]) -> list[list[float]] | None
     return columns if len(columns) >= 2 else None
 
 
-def reconstruct_grid(
+def _items_from_blocks(
     blocks: list[OCRBlock] | list[dict[str, Any]],
-    min_columns: int = 2,
-) -> TableGrid | None:
-    """Rebuild a row/column grid from OCR blocks with bboxes.
-
-    Returns None when the layout is not confidently tabular.
-    """
+) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for block in blocks:
         bbox = block.bbox if isinstance(block, OCRBlock) else block.get("bbox")
@@ -226,23 +359,48 @@ def reconstruct_grid(
                 ),
             }
         )
+    return items
+
+
+def _build_from_items(
+    items: list[dict[str, Any]],
+    min_columns: int = 2,
+) -> TableGrid | None:
+    """Build one grid from the blocks of a single table region."""
     if len(items) < min_columns * 2:
         return None
 
-    columns = _columns_from_centers(items) or _columns_from_edges(items)
+    # Low-confidence blocks are usually garbled handwriting; letting them
+    # vote on column bands invents phantom columns. They still land in
+    # cells below, so nothing disappears from the model's view.
+    confident = [
+        i
+        for i in items
+        if i.get("confidence") is None
+        or float(i["confidence"]) >= _COL_CONF_FLOOR
+    ]
+    if len(confident) < min_columns * 2:
+        confident = items
+    columns = _columns_from_centers(confident) or _columns_from_edges(confident)
     if columns is None or len(columns) < min_columns:
         return None
 
     # --- row bands from y-centers ---
-    items.sort(key=lambda i: i["cy"])
+    items = sorted(items, key=lambda i: i["cy"])
     heights = [i["y1"] - i["y0"] for i in items]
     median_h = statistics.median(heights) or 1.0
     row_gap = max(median_h * 0.5, 8.0)
+    # Merged cells (group titles) span several rows; if they anchored the
+    # row bands, their covered rows would collapse into one band. Build the
+    # bands from normal-height lines only and spread the tall ones after.
+    row_items = [
+        i for i in items if (i["y1"] - i["y0"]) <= median_h * 1.6
+    ] or items
     rows: list[list[float]] = []
-    current_min = items[0]["y0"]
-    current_max = items[0]["y1"]
-    last_cy = items[0]["cy"]
-    for i in items[1:]:
+    current_min = row_items[0]["y0"]
+    current_max = row_items[0]["y1"]
+    last_cy = row_items[0]["cy"]
+    for i in row_items[1:]:
         if abs(i["cy"] - last_cy) <= row_gap:
             current_min = min(current_min, i["y0"])
             current_max = max(current_max, i["y1"])
@@ -254,19 +412,117 @@ def reconstruct_grid(
     if len(rows) < 2:
         return None
 
-    # --- assign every block to (row, col) ---
-    cells: dict[tuple[int, int], list[str]] = {}
-    for i in items:
-        r = next(
-            (idx for idx, (y0, y1) in enumerate(rows) if y0 <= i["cy"] <= y1),
-            None,
+    # --- assign blocks to (row, col); merged cells spread across rows ---
+    cells: dict[tuple[int, int], list[tuple[float, float, str]]] = {}
+
+    def _nearest_column(cx: float) -> int:
+        return min(
+            range(len(columns)),
+            key=lambda idx: 0
+            if columns[idx][0] <= cx <= columns[idx][1]
+            else min(abs(cx - columns[idx][0]), abs(cx - columns[idx][1])),
         )
+
+    for i in items:
         c = next(
             (idx for idx, (x0, x1) in enumerate(columns) if x0 <= i["cx"] <= x1),
             None,
         )
-        if r is None or c is None:
+        if c is None:
+            # A low-confidence block can sit outside the confirmed column
+            # bands; attach it to the nearest column rather than drop it.
+            c = _nearest_column(i["cx"])
+        covered = [
+            idx
+            for idx, (y0, y1) in enumerate(rows)
+            if i["y0"] <= y1 and i["y1"] >= y0
+        ]
+        if not covered:
             continue
-        cells.setdefault((r, c), []).append(i["text"])
+        if (i["y1"] - i["y0"]) > median_h * 1.6 and len(covered) >= 2:
+            # A merged cell (group title like "肝功能" spanning several
+            # data rows): repeat it on every covered row so those rows do
+            # not read as empty group columns.
+            targets = covered
+        else:
+            targets = [
+                idx
+                for idx, (y0, y1) in enumerate(rows)
+                if y0 <= i["cy"] <= y1
+            ]
+        for r in targets:
+            cells.setdefault((r, c), []).append(
+                (i["cx"], i["cy"], i["text"], i.get("confidence"))
+            )
 
     return TableGrid(columns=columns, rows=rows, cells=cells)
+
+
+def _split_regions(
+    items: list[dict[str, Any]],
+    min_columns: int = 2,
+) -> list[list[dict[str, Any]]]:
+    """Split blocks into separate table regions at the largest vertical gap.
+
+    One photo may hold two independent tables (blood count on top, urine
+    routine below). Rebuilding across both mixes their column bands and
+    scrambles the grid; a gap of more than ~3 line heights separates them.
+    Returns [items] when the layout is a single table.
+    """
+    need = max(min_columns * 2, 4)
+    if len(items) < need * 2:
+        return [items]
+    ordered = sorted(items, key=lambda i: i["cy"])
+    heights = [i["y1"] - i["y0"] for i in ordered]
+    median_h = statistics.median(heights) or 1.0
+    row_gap = max(median_h * 0.5, 8.0)
+    bands: list[list[dict[str, Any]]] = []
+    current = [ordered[0]]
+    for i in ordered[1:]:
+        if i["cy"] - current[-1]["cy"] <= row_gap:
+            current.append(i)
+        else:
+            bands.append(current)
+            current = [i]
+    bands.append(current)
+    spans = [
+        (min(i["y0"] for i in band), max(i["y1"] for i in band))
+        for band in bands
+    ]
+    if len(spans) < 2:
+        return [items]
+    gap, split_idx = max(
+        ((spans[k + 1][0] - spans[k][1], k) for k in range(len(spans) - 1))
+    )
+    if gap < median_h * 3.0:
+        return [items]
+    cut = spans[split_idx][1]
+    above = [i for i in ordered if i["cy"] <= cut]
+    below = [i for i in ordered if i["cy"] > cut]
+    if len(above) < need or len(below) < need:
+        return [items]
+    return [above, below]
+
+
+def reconstruct_grid(
+    blocks: list[OCRBlock] | list[dict[str, Any]],
+    min_columns: int = 2,
+) -> TableGrid | None:
+    """Rebuild a row/column grid from OCR blocks with bboxes.
+
+    Returns None when the layout is not confidently tabular. When the page
+    holds several tables, the grid comes from the largest region so its
+    columns stay accurate; the other region's text still reaches the model
+    through the image itself.
+    """
+    items = _items_from_blocks(blocks)
+    if len(items) < min_columns * 2:
+        return None
+    grids = [
+        grid
+        for region in _split_regions(items, min_columns)
+        if (grid := _build_from_items(region, min_columns)) is not None
+    ]
+    if not grids:
+        return None
+    return max(grids, key=lambda g: sum(len(v) for v in g.cells.values()))

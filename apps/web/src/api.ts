@@ -54,6 +54,8 @@ export type ExtractedEvent = {
   narrative?: string | null;
   // Reconstructed multi-column table (row-major cells) for the table view.
   grid?: string[][] | null;
+  // Same-shape weak-OCR flags: cells the user should double-check.
+  grid_low_conf?: boolean[][] | null;
   facts: ExtractedFact[];
   patient_id?: string;
   source_artifact_ids?: string[];
@@ -82,6 +84,27 @@ export type UploadResult = {
     status: "verified" | "not_found" | "conflict";
     detail: string;
   }>;
+  // Table-view per-cell cross-check: one entry per cell where the
+  // GLM-corrected grid differs from the raw OCR grid.
+  grid_cross_check?: Array<{
+    row: number;
+    col: number;
+    status: "conflict";
+    ocr: string;
+    corrected: string;
+    detail: string;
+  }>;
+  // Same file (same sha256) was uploaded before for this patient.
+  duplicate_of?: {
+    artifact_id: string;
+    file_name: string;
+    created_at: string;
+  } | null;
+  // Vision-model failure: OCR text kept, structured extraction skipped.
+  llm_error?: string | null;
+  // Multi-page PDFs are recognized on the first page only; >1 means the
+  // rest of the document was not read and we must say so.
+  pdf_page_count?: number;
   quality?: {
     ok: boolean;
     issues: string[];

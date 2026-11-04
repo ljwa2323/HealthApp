@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from openai import APIStatusError, AsyncOpenAI, RateLimitError
+from openai import APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 from PIL import Image, UnidentifiedImageError
 
 from ..config import (
@@ -26,6 +26,9 @@ from ..schemas import ClinicalEvent, SourceArtifact
 from .ingestion import ClinicalNormalizer, OCRProvider, OCRResult
 
 RETRYABLE_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+# Reference ranges as printed on reports: "3.5-9.5", "3.5 ~ 9.5", "3.5至9.5".
+_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-~—至]\s*(\d+(?:\.\d+)?)")
 
 # Common lab-item units, used as a deterministic fallback when the vision
 # model omits the unit (it frequently does). Longest key wins on substring
@@ -734,6 +737,7 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         artifact: SourceArtifact,
         force_structured: bool = False,
         table_text: str | None = None,
+        require_correction: bool = False,
     ) -> str:
         mode_rule = (
             "用户选择了「分条展示」：这份文档必须分条提取。即使是叙述型文字（出院记录、病程等），"
@@ -743,12 +747,21 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             else ""
         )
         grid_rule = (
-            "OCR 已把版面重建为行列表格（第1行从表头开始；\"-\"表示该格 OCR 未读到）：\n"
+            "OCR 已把版面重建为行列表格（第1行开始；\"-\"表示该格 OCR 未读到）：\n"
             f"{table_text}\n"
             "请结合原图核对，**严格按这个行列网格逐格提取**：每格对应一条数据，"
             "列顺序必须与网格一致，不要把相邻列混在一起，也不要把多列内容概括成一条。\n"
             "网格中标注了【轴刻度行，非数据】的行是图表坐标轴的刻度数值（如体温单左侧 "
             "180 42°、160 41° 这类等差刻度），不是记录数据，绝对不要提取为事实。\n"
+            + (
+                "此外，**必须额外输出 corrected_grid**：一个与上面网格行列严格一一对应的"
+                "二维数组（外层是行、内层是该行所有格子），逐格给出你结合原图纠正后的文本——"
+                "把 OCR 乱码纠正为合理值（如 \"7/6\"→\"g/L\"、\"130180\"→\"130/80\"），"
+                "正常值原样保留不要改动，空格子保持空字符串 \"\"，轴刻度行原样输出即可。"
+                "它是用户核对表格时的最终内容，行列数必须与网格一致，不得增删行。\n"
+                if require_correction
+                else ""
+            )
             if table_text
             else ""
         )
@@ -779,7 +792,8 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             '  "narrative_text": "仅 format=narrative 时填写完整原文；structured 时写 null",\n'
             '  "facts": [\n'
             '    {"kind": "observation|medication|condition|symptom|note|procedure", "concept": "项目名或药名或诊断名", "value": 数值或字符串, "unit": "单位(检验/体征有则填，否则null)", "reference": "参考范围(检验有则填，否则null)", "interpretation": "low|normal|high|unknown(仅检验填，否则unknown)", "attrs": {"该类型专属字段": "值"}}\n'
-            "  ]\n"
+            "  ],\n"
+            '  "corrected_grid": [["纠正后的格子文本", "..."], ["..."]],  // 仅当 prompt 要求输出 corrected_grid 时必填，否则省略\n'
             "}\n"
             "规则：\n"
             "1. kind 与 document_type 对应（检验→observation，处方→medication，诊断类→condition，症状→symptom，影像所见/结论→note，手术→procedure）；\n"
@@ -793,12 +807,19 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             "   laboratory、vital、other 的 attrs 留空 {}；\n"
             "3. value 若是文字结果（如 阴性/阳性/未见）则填字符串；\n"
             "4. 没有对应信息就写 null，不要编造。\n"
-            "5. 不要使用 format=narrative 或 narrative_text，所有文档（包括出院小结、诊断证明、病程记录）都必须按字段拆成 facts 数组，不要整段文本\n"
-            "6. 手写/低清晰度数字常被 OCR 误读成乱码（如 130180、OL/ol!、1/YE），这些格子实际是有数据的，"
+            "5. 手写/低清晰度数字常被 OCR 误读成乱码（如 130180、OL/ol!、1/YE），这些格子实际是有数据的，"
             "请结合图像把每格纠正成合理值（130/80、120/70、1/日），宁可纠正也不要丢弃有数据的格子；"
             "只有确认格子内确实没有内容时才跳过。0↔O、1↔l、7↔1、2↔Z，手写“日”字常被读成 YE/E/Y。\n"
-            "7. 同一项目出现在多个格子时按格分别提取、分别作为一条 fact；行首的项目名（如“血压mmHg”“总入量 ml”）只作标识，"
+            "6. 同一项目出现在多个格子时按格分别提取、分别作为一条 fact；行首的项目名（如“血压mmHg”“总入量 ml”）只作标识，"
             "不要单独作为一条 fact 重复输出。\n"
+            "7. facts 粒度宁粗勿细：一段连续叙述（手术经过、影像所见/印象、病程描述）整体作为一条 note fact，"
+            "不要按句号逐句拆成多条；只有存在明确“项目—数值/结果”对应关系时才一项一条 fact。\n"
+            "8. format 判定硬标准：图上有表格线、分列排版、逐项项目名紧跟数值/结果 → structured；"
+            "整页是大段连续文字、没有表格 → narrative。出院记录/入院记录/病程记录即使按日期分段，仍属 narrative，"
+            "不要把段落逐句拆成 facts。\n"
+            "9. medication 必须完整：如“0.5% 氯霉素滴眼液 2支 外用 每日3次”要提取成一条 fact，"
+            "attrs 含 dose=0.5%、quantity=2支、route=外用、frequency=每日3次；"
+            "禁止只写药名而丢掉剂量/频次/用法。\n"
             f"文件名：{artifact.file_name}。只输出这个 JSON 对象。"
         )
 
@@ -809,6 +830,7 @@ class GLMVisionNormalizer(ClinicalNormalizer):
         content: bytes,
         force_structured: bool = False,
         table_text: str | None = None,
+        require_correction: bool = False,
     ) -> ClinicalEvent | None:
         if not content:
             return None
@@ -820,7 +842,10 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                     {
                         "type": "text",
                         "text": self._build_prompt(
-                            artifact, force_structured, table_text
+                            artifact,
+                            force_structured,
+                            table_text,
+                            require_correction,
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": data_url}},
@@ -847,6 +872,11 @@ class GLMVisionNormalizer(ClinicalNormalizer):
             except RateLimitError as exc:
                 last_error = exc
                 await asyncio.sleep(20 * (attempt + 1))
+            except APITimeoutError as exc:
+                # Long narrative pages can legitimately exceed the 240s
+                # budget. Retrying only stacks dead wait (observed 487s+);
+                # fail fast so the caller falls back to the OCR text instead.
+                raise ValueError(f"GLM vision timed out after 240s: {exc}") from exc
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt == 11:
@@ -990,7 +1020,18 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                 fact["value"] = {"type": "text", "text": str(value)}
             ref = raw.get("reference") or raw.get("reference_range")
             if ref:
-                fact["reference_range"] = {"text": str(ref), "unit": str(unit) if unit else None}
+                ref_text = str(ref)
+                ref_range: dict[str, Any] = {
+                    "text": ref_text,
+                    "unit": str(unit) if unit else None,
+                }
+                # Parse the printed bounds so the frontend can judge high/low
+                # locally instead of re-parsing "3.5-9.5" strings everywhere.
+                parsed = _RANGE_RE.search(ref_text)
+                if parsed:
+                    ref_range["low"] = float(parsed.group(1))
+                    ref_range["high"] = float(parsed.group(2))
+                fact["reference_range"] = ref_range
             interp = str(raw.get("interpretation") or "unknown").lower()
             if interp not in {"low", "normal", "high", "abnormal", "unknown"}:
                 interp = "unknown"
@@ -1017,6 +1058,14 @@ class GLMVisionNormalizer(ClinicalNormalizer):
                 pass
 
         event["facts"] = facts
+        # Per-cell corrected matrix (same shape as the OCR grid). The caller
+        # validates/normalizes it against the reconstructed grid; raw value
+        # is kept here so shape checks live next to the grid object.
+        corrected = payload.get("corrected_grid")
+        if isinstance(corrected, list) and corrected and all(
+            isinstance(row, list) for row in corrected
+        ):
+            event["grid"] = [[str(c) for c in row] for row in corrected]
         return ClinicalEvent.model_validate(event)
 
 

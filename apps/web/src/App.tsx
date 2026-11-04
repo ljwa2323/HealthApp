@@ -1171,7 +1171,7 @@ function FactReviewPanel({
   crossCheck?: Array<{
     fact_id: string;
     concept: string;
-    status: "verified" | "not_found" | "conflict";
+    status: "verified" | "not_found" | "conflict" | "missing_field";
     detail: string;
   }>;
   review: Record<
@@ -1619,6 +1619,9 @@ function FactReviewPanel({
             const notFound = crossCheck.filter(
               (c) => c.status === "not_found",
             ).length;
+            const missing = crossCheck.filter(
+              (c) => c.status === "missing_field",
+            ).length;
             return (
               <>
                 <strong>OCR × AI 比对</strong>
@@ -1628,6 +1631,9 @@ function FactReviewPanel({
                 )}
                 {notFound > 0 && (
                   <span className="cc-warn">{notFound} 项 OCR 未读到</span>
+                )}
+                {missing > 0 && (
+                  <span className="cc-warn">{missing} 项用药字段待补</span>
                 )}
                 <span className="cc-hint">
                   （不一致 / 未读到仅提示，不代表 AI 错误，请人工核对）
@@ -1681,7 +1687,11 @@ function FactReviewPanel({
                     className={`cc-badge cc-badge-${cc.status}`}
                     title={cc.detail}
                   >
-                    {cc.status === "conflict" ? "与OCR不一致" : "OCR未读到"}
+                    {cc.status === "conflict"
+                      ? "与OCR不一致"
+                      : cc.status === "missing_field"
+                        ? "用药字段待补"
+                        : "OCR未读到"}
                   </span>
                 )}
               </div>
@@ -1824,15 +1834,37 @@ function FactReviewPanel({
 function GridReviewPanel({
   grid,
   onGridChange,
+  crossCheck,
+  gridLowConf,
 }: {
   grid: string[][];
   onGridChange: (matrix: string[][]) => void;
+  gridLowConf?: boolean[][];
+  crossCheck?: Array<{
+    row: number;
+    col: number;
+    status: "conflict";
+    ocr: string;
+    corrected: string;
+    detail: string;
+  }>;
 }) {
   const colCount = grid.length ? grid[0].length : 0;
+  const conflictMap = new Map(
+    (crossCheck ?? []).map((c) => [`${c.row}:${c.col}`, c]),
+  );
+  const conflicts = (crossCheck ?? []).length;
   return (
     <div className="grid-review">
       <p className="no-facts-hint">
         检测到多列表格，已按行列重建。可直接编辑每个格子，核对后加入时间轴
+        {conflicts > 0 ? (
+          <span className="grid-check-badge">
+            {conflicts} 处 AI 纠正待核对
+          </span>
+        ) : (
+          <span className="grid-check-badge ok">OCR 与 AI 核对一致</span>
+        )}
       </p>
       <div className="grid-table-wrap">
         <table className="grid-table">
@@ -1840,19 +1872,44 @@ function GridReviewPanel({
             {grid.map((row, r) => (
               <tr key={r}>
                 <td className="grid-row-index">{r + 1}</td>
-                {Array.from({ length: colCount }, (_, c) => (
-                  <td key={c}>
-                    <input
-                      value={row[c] ?? ""}
-                      placeholder="-"
-                      onChange={(e) => {
-                        const next = grid.map((rr) => [...rr]);
-                        next[r][c] = e.target.value;
-                        onGridChange(next);
-                      }}
-                    />
-                  </td>
-                ))}
+                {Array.from({ length: colCount }, (_, c) => {
+                  const hit = conflictMap.get(`${r}:${c}`);
+                  const low = !!gridLowConf?.[r]?.[c];
+                  const cls = [
+                    hit ? "grid-cell-conflict" : "",
+                    low ? "grid-cell-lowconf" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+                  return (
+                    <td
+                      key={c}
+                      className={cls || undefined}
+                      title={
+                        hit
+                          ? `${hit.detail}（OCR「${hit.ocr}」→ AI「${hit.corrected}」，可编辑修正）`
+                          : low
+                            ? "该格 OCR 置信度低，请对照原图核对"
+                            : undefined
+                      }
+                    >
+                      <input
+                        value={row[c] ?? ""}
+                        placeholder="-"
+                        onChange={(e) => {
+                          const next = grid.map((rr) => [...rr]);
+                          next[r][c] = e.target.value;
+                          onGridChange(next);
+                        }}
+                      />
+                      {hit ? (
+                        <span className="grid-cell-mark" aria-hidden="true">
+                          AI
+                        </span>
+                      ) : null}
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>
@@ -1906,6 +1963,20 @@ function UploadPage({
   // Editable copy of the reconstructed table (row-major matrix). Null when
   // the document had no tabular layout.
   const [gridEdits, setGridEdits] = useState<string[][] | null>(null);
+  const [dupNotice, setDupNotice] = useState<{
+    file_name: string;
+    created_at: string;
+  } | null>(null);
+  const [gridCrossCheck, setGridCrossCheck] = useState<
+    Array<{
+      row: number;
+      col: number;
+      status: "conflict";
+      ocr: string;
+      corrected: string;
+      detail: string;
+    }>
+  >([]);
   // On-demand split: narrative documents are NOT pre-split at upload
   // (keeps the initial extraction fast). When the user taps 分条展示, we
   // call the /split endpoint once and cache the facts here.
@@ -2009,6 +2080,15 @@ function UploadPage({
       setGridEdits(
         result.extracted_event?.grid
           ? result.extracted_event.grid.map((row) => [...row])
+          : null,
+      );
+      setGridCrossCheck(result.grid_cross_check ?? []);
+      setDupNotice(
+        result.duplicate_of
+          ? {
+              file_name: result.duplicate_of.file_name,
+              created_at: result.duplicate_of.created_at,
+            }
           : null,
       );
       setSplitFacts(null);
@@ -2321,6 +2401,8 @@ function UploadPage({
                     <GridReviewPanel
                       grid={gridEdits ?? ev.grid}
                       onGridChange={setGridEdits}
+                      crossCheck={gridCrossCheck}
+                      gridLowConf={ev.grid_low_conf ?? undefined}
                     />
                   ) : viewMode === "structured" ? (
                     displayFacts.length > 0 ? (
@@ -2401,6 +2483,12 @@ function UploadPage({
                 <p className="no-facts-hint">
                   未能自动识别出结构化字段，下面是原始识别文字，可先人工确认
                 </p>
+                {uploadState.result.llm_error && (
+                  <p className="add-error">
+                    AI 识别失败，已保留 OCR 原文（{uploadState.result.llm_error}）。
+                    可重新上传再试，或按原文手动录入。
+                  </p>
+                )}
                 <pre className="ocr-result-text">
                   {uploadState.result.artifact.ocr_text || "（未识别到文字）"}
                 </pre>
@@ -2422,6 +2510,32 @@ function UploadPage({
             }))
           }
         />
+      )}
+
+      {dupNotice && (
+        <div
+          className="quality-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="重复上传"
+        >
+          <div className="quality-modal">
+            <span className="eyebrow">重复上传</span>
+            <h2>这个文件之前上传过</h2>
+            <p>
+              该文件与之前上传的《{dupNotice.file_name}》（
+              {dupNotice.created_at.slice(0, 10)}）内容相同，可能重复添加。
+            </p>
+            <div className="quality-actions">
+              <button
+                className="primary-button"
+                onClick={() => setDupNotice(null)}
+              >
+                知道了，继续
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {retryOpen && (

@@ -122,6 +122,9 @@ class ClinicalEvent(BaseModel):
     # layout was tabular; the frontend renders it as a reviewable table
     # instead of a flat fact list.
     grid: list[list[str]] | None = None
+    # Same-shape weak-OCR flags: True where the cell came from a low-
+    # confidence OCR block and the user should double-check against the image.
+    grid_low_conf: list[list[bool]] | None = None
 
 
 class SourceArtifact(BaseModel):
@@ -168,6 +171,18 @@ class IngestionResult(BaseModel):
     # the raw OCR text supports (verified) or contradicts (conflict) the
     # AI extraction, or never mentioned it (not_found).
     cross_check: list[dict[str, Any]] = Field(default_factory=list)
+    # Table-view per-cell cross-check: cells where the GLM-corrected grid
+    # differs from the raw OCR grid (conflict entries with row/col/ocr/corrected).
+    grid_cross_check: list[dict[str, Any]] = Field(default_factory=list)
+    # Set when the same file (same sha256) was uploaded before for this
+    # patient: {artifact_id, file_name, created_at} of the earlier record.
+    duplicate_of: dict[str, Any] | None = None
+    # Vision-model failure: OCR text was kept, structured extraction did not
+    # run. The frontend shows the raw text and a retry hint instead of a 502.
+    llm_error: str | None = None
+    # Multi-page PDFs are rasterized to the first page only. >1 means the
+    # rest of the document was NOT recognized and the user should be told.
+    pdf_page_count: int = 0
 
 
 class AgentContext(BaseModel):
