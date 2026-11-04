@@ -19,6 +19,7 @@ HealthApp turns scattered laboratory reports, imaging reports, prescriptions, di
 - `docs/architecture.md`: system architecture
 - `docs/data-model.md`: longitudinal health data model
 - `docs/product-spec.md`: product and UX specification
+- `docs/progress/`: 阶段性中文进度说明（识别、时间轴、AI 咨询）
 - `examples/patient_record.json`: example canonical patient record
 
 ## MVP workflow
@@ -76,24 +77,23 @@ curl -X POST http://localhost:8000/api/dev/load-demo
 ## What is implemented now
 
 - responsive overview, timeline, upload and AI context interfaces
-- canonical longitudinal schemas
-- source artifact and OCR provenance model
-- document ingestion boundary
-- task-specific Agent context builder
+- registration auth and NVIDIA OCR/LLM ingestion adapters
+- laboratory reference-range extraction and timeline display
+- canonical longitudinal schemas with provenance
+- document ingestion boundary and Agent context builder
+- interactive health assistant (analyze / chat)
 - demo patient timeline
-- frontend upload call to the API
 
-The OCR provider and LLM normalizer are intentionally adapters in the first commit. They can be connected to PaddleOCR, another OCR engine, and the chosen LLM without changing the canonical data model.
+阶段性详细进展见 [`docs/progress/`](./docs/progress/README.md)。
 
 ## Next implementation priorities
 
-1. PostgreSQL and object storage
-2. production OCR provider
-3. LLM extraction with JSON schema validation
-4. terminology normalization and unit conversion
-5. duplicate and conflict resolution
-6. human review screen
-7. longitudinal trend query APIs
-8. authentication, encryption and audit logging
-9. FHIR import/export adapters
-10. mobile PWA packaging
+1. 合入 `dev/yexiaohan` 识别链路（RapidOCR、质量门、多页 PDF、交叉核对）
+2. AI 助手置信度校准、SSE 对话持久化压测、用户反馈
+3. 手写体改为人工/语音录入窗口（不做自动 OCR）
+4. PostgreSQL 与对象存储
+5. 术语归一化与单位换算
+6. 重复/冲突消解与人工审核落库
+7. 认证加密与审计日志
+8. FHIR 导入导出
+9. 移动端 PWA
