@@ -348,15 +348,40 @@ _AFFIRM_WORDS = {
 _DENY_WORDS = ("没有找到", "未找到", "没有相关记录", "没有这类记录", "未见", "查无")
 # 答案已经说明"只能当候选、需要确认"时，附带的列举不算肯定说法
 _HEDGE_RE = re.compile(r"没有完全对上|没有完全匹配|候选|需要.{0,4}确认|不确定|无法确认|待确认")
-# 肯定词前面有否定词，是"不能确认你做过"这种写法，不算下结论
+# 肯定词所在的分句里有否定或假设，是"不能确认你做过""如果做过"这种写法，不算下结论
 _NEGATION_RE = re.compile(r"不能|无法|没有|未见|并非|不确定|难以|存疑|是否|如果|假如|若|要是")
+_CLAUSE_SPLIT_RE = re.compile(r"[，,、；;。\n]")
 
 
-def _sentence_around(text: str, index: int) -> str:
-    start = max(text.rfind(mark, 0, index) for mark in ("。", "；", "\n")) + 1
-    ends = [pos for pos in (text.find(mark, index) for mark in ("。", "；", "\n")) if pos != -1]
-    end = min(ends) if ends else len(text)
+def _clause_around(text: str, index: int) -> tuple[str, int]:
+    """取肯定词所在的分句。分句而不是整句：上一分句的"如果"不该压住下一分句的结论。"""
+    start = 0
+    for match in _CLAUSE_SPLIT_RE.finditer(text, 0, index):
+        start = match.end()
+    nxt = _CLAUSE_SPLIT_RE.search(text, index)
+    end = nxt.start() if nxt else len(text)
     return text[start:end], start
+
+
+def _near_entity(answer: str, match: re.Match, entities: list[str]) -> bool:
+    """肯定词要挨着被问的那个药名或术式，光凭"做过"两个字不能定罪。"""
+    window = answer[max(0, match.start() - 12): match.end() + 12]
+    return any(entity and entity in window for entity in entities)
+
+
+def _find_claim(answer: str, phrases: tuple[str, ...], entities: list[str]) -> str | None:
+    for phrase in phrases:
+        for match in re.finditer(phrase, answer):
+            clause, clause_start = _clause_around(answer, match.start())
+            if _HEDGE_RE.search(clause):
+                continue
+            if _NEGATION_RE.search(clause[: match.start() - clause_start]):
+                continue
+            # 检索带了具体药名/术式时，必须贴着它说，避免"做过检查"这类话被算成手术
+            if entities and not _near_entity(answer, match, entities):
+                continue
+            return phrase
+    return None
 
 
 def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
@@ -386,20 +411,13 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
             return {"kind": lookup["kind"], "reason": f"检索到 {len(matched)} 条记录，答案一条都没有提到"}
 
     denies = re.search("|".join(_DENY_WORDS), answer)
-    affirm = None
-    for phrase in _AFFIRM_WORDS.get(lookup.get("kind"), ()):
-        for match in re.finditer(phrase, answer):
-            sentence, sentence_start = _sentence_around(answer, match.start())
-            # 同一句里写着"只能算候选、需要确认"的，不算下了结论
-            if _HEDGE_RE.search(sentence):
-                continue
-            # 肯定词前面有否定词，比如"不能确认你做过""是否做过还没核实"
-            if _NEGATION_RE.search(sentence[: match.start() - sentence_start]):
-                continue
-            affirm = phrase
-            break
-        if affirm:
-            break
+    if lookup.get("kind") == "medication":
+        entities = [normalize_drug(lookup.get("hint") or "")]
+        entities += [normalize_drug(item.get("drug") or "") for item in matched + (lookup.get("candidates") or [])]
+    else:
+        entities = [lookup.get("keyword") or ""] + [item.get("name") or "" for item in matched]
+    entities = [entity for entity in dict.fromkeys(entities) if entity and len(entity) >= 2]
+    affirm = _find_claim(answer, _AFFIRM_WORDS.get(lookup.get("kind"), ()), entities)
 
     if matched:
         if not (cited & matched_ids) and not named:
@@ -423,13 +441,31 @@ _UNCERTAINTY_WORDS = (
 )
 
 
-def check_advice_answer(answer: str, question_type: str | None) -> list[str]:
+# 路由可能把建议类问题判成 summary，所以问句本身也要看
+_ADVICE_QUESTION_RE = re.compile(
+    r"要不要|该不该|需不需要|用不用|能不能做|是否有必要|有没有必要|值得(做|手术|用)|"
+    r"是否建议|建议(我)?(做|用|手术)|怎么处理|怎么办|如何治疗|要不要紧|风险大"
+)
+
+
+def is_advice_question(question_type: str | None, question: str | None) -> bool:
+    """路由说是建议类，或者问句本身就是在要判断，都按建议类处理。"""
+    if question_type == "advice":
+        return True
+    return bool(question and _ADVICE_QUESTION_RE.search(question))
+
+
+def check_advice_answer(
+    answer: str,
+    question_type: str | None,
+    question: str | None = None,
+) -> list[str]:
     """建议类回答的粗检：允许写通用常识，但不许写成有出处的硬结论。
 
     能查的只有三件事：有没有点名具体指南、有没有给没有记录支撑的比例、
     有没有交代不确定性。查不出"常识本身对不对"，那要靠人看。
     """
-    if question_type != "advice":
+    if not is_advice_question(question_type, question):
         return []
 
     flags: list[str] = []
@@ -564,7 +600,7 @@ async def answer_question(
     lookup_check = check_lookup_consistency(answer, context_payload.get("lookup_result"))
     if lookup_check:
         citations["lookup_conflict"] = lookup_check
-    advice_flags = check_advice_answer(answer, context_payload.get("question_type"))
+    advice_flags = check_advice_answer(answer, context_payload.get("question_type"), question)
     if advice_flags:
         citations["advice_flags"] = advice_flags
     confidence = compute_confidence(context_payload, citations)
@@ -619,7 +655,7 @@ async def answer_question_stream(
     lookup_check = check_lookup_consistency(full_answer, context_payload.get("lookup_result"))
     if lookup_check:
         citations["lookup_conflict"] = lookup_check
-    advice_flags = check_advice_answer(full_answer, context_payload.get("question_type"))
+    advice_flags = check_advice_answer(full_answer, context_payload.get("question_type"), question)
     if advice_flags:
         citations["advice_flags"] = advice_flags
     confidence = compute_confidence(context_payload, citations)

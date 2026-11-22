@@ -29,7 +29,7 @@ from .services.auth_store import UserRecord, get_store
 from .services.context_builder import build_agent_context
 from .services.health_assistant import answer_question, answer_question_stream
 from .services.ingestion import ingest_document
-from .services.intent_router import route_question
+from .services.intent_router import Intent, route_question
 
 app = FastAPI(
     title="HealthApp API",
@@ -529,6 +529,35 @@ def delete_conversation(
     return {"ok": True}
 
 
+async def _load_context_events(
+    patient_id: str, question: str
+) -> tuple[Intent, date | None, list]:
+    """路由一次，按时间窗取事件。
+
+    窗口内取不到就退回全量并清掉窗口，让模型自己说"这个时间段没有记录"，
+    不能因为时间窗空结果就告诉用户"档案里没有这个人"。
+    """
+    route = await route_question(question)
+    effective_start = (
+        route.time_start - timedelta(days=7) if route.time_start else None
+    )
+    events = get_store().list_events(
+        patient_id,
+        time_start=effective_start,
+        time_end=route.time_end,
+    )
+    if not events:
+        events = get_store().list_events(patient_id)
+        effective_start = None
+        route = replace(route, time_start=None)
+    if not events:
+        raise HTTPException(
+            status_code=400,
+            detail="No timeline records available for chat",
+        )
+    return route, effective_start, events
+
+
 @app.post(
     "/api/patients/{patient_id}/assistant/chat",
     response_model=AssistantReply,
@@ -542,26 +571,7 @@ async def assistant_chat(
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # 意图路由先行：拿时间窗用于 SQL 下推，同时传给回答服务避免二次路由
-    route = await route_question(question)
-    effective_start = (
-        route.time_start - timedelta(days=7) if route.time_start else None
-    )
-    events = get_store().list_events(
-        user.patient_id,
-        time_start=effective_start,
-        time_end=route.time_end,
-    )
-    if not events:
-        # 时间窗内无数据：回退全量并清空窗口，让 LLM 说明"该时间窗无记录"
-        events = get_store().list_events(user.patient_id)
-        effective_start = None
-        route = replace(route, time_start=None)
-    if not events:
-        raise HTTPException(
-            status_code=400,
-            detail="No timeline records available for chat",
-        )
+    route, effective_start, events = await _load_context_events(user.patient_id, question)
 
     store = get_store()
     conv_id = payload.conversation_id
@@ -608,26 +618,7 @@ async def assistant_chat_stream(
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    # 意图路由先行：拿时间窗用于 SQL 下推，同时传给回答服务避免二次路由
-    route = await route_question(question)
-    effective_start = (
-        route.time_start - timedelta(days=7) if route.time_start else None
-    )
-    events = get_store().list_events(
-        user.patient_id,
-        time_start=effective_start,
-        time_end=route.time_end,
-    )
-    if not events:
-        # 时间窗内无数据：回退全量并清空窗口，让 LLM 说明"该时间窗无记录"
-        events = get_store().list_events(user.patient_id)
-        effective_start = None
-        route = replace(route, time_start=None)
-    if not events:
-        raise HTTPException(
-            status_code=400,
-            detail="No timeline records available for chat",
-        )
+    route, effective_start, events = await _load_context_events(user.patient_id, question)
 
     store = get_store()
     conv_id = payload.conversation_id
