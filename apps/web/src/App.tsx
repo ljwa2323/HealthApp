@@ -2595,10 +2595,16 @@ function CitationNotice({ check }: { check?: CitationCheck | null }) {
   const mismatches = check?.mismatched_values ?? [];
   const hallucinated = check?.hallucinated_citations ?? [];
   const conflict = check?.lookup_conflict;
-  if (mismatches.length === 0 && hallucinated.length === 0 && !conflict) return null;
+  const adviceFlags = check?.advice_flags ?? [];
+  if (mismatches.length === 0 && hallucinated.length === 0 && !conflict && adviceFlags.length === 0) return null;
+  const recordIssue = mismatches.length > 0 || hallucinated.length > 0 || Boolean(conflict);
   return (
     <div className="citation-warning">
-      <strong>这段回答的引用与记录不一致，请对照原报告核对</strong>
+      <strong>
+        {recordIssue
+          ? "这段回答的引用与记录不一致，请对照原报告核对"
+          : "这段回答里有需要你自己核实的说法"}
+      </strong>
       <ul>
         {mismatches.map((item) => (
           <li key={`${item.fact_id}-${item.answer_value}`}>
@@ -2613,6 +2619,9 @@ function CitationNotice({ check }: { check?: CitationCheck | null }) {
             {conflict.kind === "procedure" ? "手术记录" : "用药记录"}：{conflict.reason}
           </li>
         )}
+        {adviceFlags.map((flag) => (
+          <li key={flag}>{flag}</li>
+        ))}
       </ul>
     </div>
   );

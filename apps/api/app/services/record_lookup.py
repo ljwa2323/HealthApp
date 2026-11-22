@@ -97,31 +97,136 @@ def _drug_score(hint: str, drug: str) -> tuple[float, str]:
     return (ratio, "similar") if ratio >= SIMILAR_FLOOR else (ratio, "none")
 
 
-def _duration(since: str | None, stopped: str | None, today: date) -> dict:
-    """按记录算用药时长；没有开始时间就不猜。"""
-    if not since:
-        return {"days": None, "text": None, "ongoing": False}
-    try:
-        start = date.fromisoformat(since[:10])
-    except ValueError:
-        return {"days": None, "text": None, "ongoing": False}
-
-    ongoing = not stopped
-    end = today if ongoing else date.fromisoformat(stopped[:10])
-    days = (end - start).days
-    if days < 0:
-        return {"days": None, "text": None, "ongoing": ongoing}
-
+def _span_text(days: int) -> str:
     months = days / 30.44
-    span = f"约 {months:.1f} 个月" if months >= 1 else f"{days} 天"
-    if ongoing:
-        text = (
-            f"记录显示 {since[:10]} 起在用，至今{span}；"
-            "这是按最后一条记录推算的，不代表一定还在服用"
-        )
+    return f"约 {months:.1f} 个月" if months >= 1 else f"{days} 天"
+
+
+_FREQ_PATTERNS = (
+    (re.compile(r"隔日|隔天|每两日|每2日|qod|every other", re.I), 0.5),
+    (re.compile(r"每\s*(?:周|星期)"), 1 / 7),
+    (re.compile(r"每\s*月"), 1 / 30),
+    (re.compile(r"每\s*[日天]"), 1.0),
+)
+_FREQ_RATIO_RE = re.compile(r"(\d+)\s*[日天]\s*(\d+)\s*次")
+_FREQ_PER_WEEK_RE = re.compile(r"每\s*(?:周|星期)\s*(\d+)\s*次")
+
+
+def _dose_multiplier(frequency: str | None) -> float | None:
+    """把频次换算成"每过 1 天，实际吃到的天数占比"。
+
+    "两天吃一次"得来 0.5，"每周一次"得来 1/7，换算不出来的返回 None。
+    """
+    text = (frequency or "").strip()
+    if not text:
+        return None
+    ratio = _FREQ_RATIO_RE.search(text)
+    if ratio:
+        every, times = int(ratio.group(1)), int(ratio.group(2))
+        if every > 0 and times > 0:
+            return min(1.0, times / every)
+    per_week = _FREQ_PER_WEEK_RE.search(text)
+    if per_week:
+        return min(1.0, int(per_week.group(1)) / 7)
+    for pattern, multiplier in _FREQ_PATTERNS:
+        if pattern.search(text):
+            return multiplier
+    return None
+
+
+def _course_info(course, frequency: str | None, is_last: bool) -> dict:
+    """一段用药期的时间跨度。只用记录本身，不往"今天"外推。"""
+    since, until, last = course.since, course.until, getattr(course, "last", None)
+    days = None
+    if since:
+        start = date.fromisoformat(since[:10])
+        end_text = until or (last if course.records > 1 else None)
+        if end_text:
+            days = (date.fromisoformat(end_text[:10]) - start).days
+    # 没有停药记录又在最后一段：不能断定已经停了，也不能断定还在吃
+    ongoing = is_last and not until
+    dose_days = None
+    multiplier = _dose_multiplier(frequency)
+    if days is not None and multiplier is not None:
+        dose_days = round(days * multiplier)
+    return {
+        "since": since,
+        "until": until,
+        "last": last,
+        "days": days,
+        "dose_days": dose_days,
+        "records": course.records,
+        "ongoing": ongoing,
+    }
+
+
+def _med_duration(med, today: date) -> dict:
+    """按疗程算时长：用药期有多长、实际吃了多少天，分开说。"""
+    courses = getattr(med, "courses", None) or []
+    if not courses:
+        return {
+            "days": None, "span_days": None, "dose_days": None,
+            "text": None, "ongoing": False, "courses": [],
+        }
+
+    infos = [
+        _course_info(course, med.frequency, is_last=(index == len(courses) - 1))
+        for index, course in enumerate(courses)
+    ]
+    dated = [info for info in infos if info["since"]]
+
+    if not dated:
+        return {
+            "days": None, "span_days": None, "dose_days": None,
+            "text": "记录里没有写用药日期，算不出时长",
+            "ongoing": False, "courses": infos,
+        }
+
+    total_days = sum(info["days"] for info in infos if info["days"]) if any(info["days"] for info in infos) else None
+    dose_days = sum(info["dose_days"] for info in infos if info["dose_days"]) if any(info["dose_days"] for info in infos) else None
+    first = date.fromisoformat(dated[0]["since"][:10])
+    last_text = dated[-1]["until"] or dated[-1]["last"]
+    last_day = date.fromisoformat(last_text[:10]) if last_text else first
+    span_days = (last_day - first).days if last_day > first else None
+    ongoing = any(info["ongoing"] for info in infos)
+
+    pieces: list[str] = []
+    for index, info in enumerate(dated, start=1):
+        if info["days"] is None:
+            piece = f"{info['since']} 只有一次记录，没写用药起止"
+        elif info["until"]:
+            piece = f"{info['since']}～{info['until']}，用药期{_span_text(info['days'])}"
+            if info["dose_days"] is not None:
+                piece += f"，按“{med.frequency}”算约 {info['dose_days']} 天在服药"
+        else:
+            piece = (
+                f"{info['since']} 起有记录，按记录算到 {info['last']} 约{_span_text(info['days'])}"
+            )
+            if info["dose_days"] is not None:
+                piece += f"，按“{med.frequency}”算约 {info['dose_days']} 天在服药"
+        pieces.append(f"第{index}段：{piece}" if len(dated) > 1 else piece)
+
+    if len(dated) > 1:
+        text = "共 " + str(len(dated)) + " 段用药期。" + "；".join(pieces)
+        if total_days is not None:
+            text += f"。累计用药期{_span_text(total_days)}"
+        if span_days is not None:
+            text += f"，从第一次到最后一条记录跨{_span_text(span_days)}，中间的空档不算在吃药"
+        if dose_days is not None:
+            text += f"，估计实际服药 {dose_days} 天"
     else:
-        text = f"{since[:10]} 到 {stopped[:10]}，{span}"
-    return {"days": days, "text": text, "ongoing": ongoing}
+        text = pieces[0]
+    if ongoing:
+        text += "；最后一段没有停药记录，之后是否还在吃没法从档案确认"
+
+    return {
+        "days": total_days,
+        "span_days": span_days,
+        "dose_days": dose_days,
+        "text": text,
+        "ongoing": ongoing,
+        "courses": infos,
+    }
 
 
 def _procedure_keyword(question: str) -> str | None:
@@ -167,7 +272,7 @@ def lookup_procedures(agg: AggregatedContext, question: str, keyword: str | None
 
 
 def _med_item(med, today: date) -> dict:
-    duration = _duration(med.since, med.stopped, today)
+    duration = _med_duration(med, today)
     return {
         "drug": med.drug,
         "dose": med.dose,
@@ -177,7 +282,10 @@ def _med_item(med, today: date) -> dict:
         "since": med.since,
         "stopped": med.stopped,
         "duration_days": duration["days"],
+        "span_days": duration["span_days"],
+        "dose_days": duration["dose_days"],
         "duration_text": duration["text"],
+        "courses": duration["courses"],
         "ongoing": duration["ongoing"],
         "fact_id": med.fact_id,
     }

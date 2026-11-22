@@ -46,6 +46,7 @@ VALID_QUESTION_TYPES = {
     "specific_event",
     "existence_query",
     "medication_lookup",
+    "advice",
     "unknown",
 }
 
@@ -77,7 +78,9 @@ ROUTER_SYSTEM = (
     "- question_type: 问题类型，只能是 trend_query（趋势变化）/ latest_value（最新值）/ "
     "medication_review（用药情况）/ summary（整体总结）/ specific_event（某次具体事件）/ "
     "existence_query（有没有做过某事，如有没有做过手术）/ "
-    "medication_lookup（问某种药吃没吃过、吃了多久）/ unknown 之一。\n"
+    "medication_lookup（问某种药吃没吃过、吃了多久）/ "
+    "advice（要不要做某手术、该不该用某药、这种情况该怎么处理这类需要给判断的问题）/ "
+    "unknown 之一。\n"
     "- time_start / time_end: ISO 日期 YYYY-MM-DD。用户说'近半年'就从今天往前推 6 个月；"
     "说'最近三个月'就推 3 个月；说'今年'就从 1 月 1 日开始；没提时间就都给 null。\n"
     "- matched_concepts: 用户问题里提到的具体指标名（中文），比如 ['肌酐', 'eGFR']。"

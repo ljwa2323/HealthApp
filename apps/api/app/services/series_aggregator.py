@@ -30,6 +30,16 @@ class Series:
 
 
 @dataclass
+class MedicationCourse:
+    """一段连续用药：同一味药被拆成几段，是因为中间停过。"""
+    since: str | None
+    until: str | None
+    records: int
+    status: str | None = None
+    last: str | None = None
+
+
+@dataclass
 class MedicationState:
     drug: str
     dose: str | None
@@ -39,6 +49,7 @@ class MedicationState:
     frequency: str | None = None
     route: str | None = None
     quantity: str | None = None
+    courses: list[MedicationCourse] = field(default_factory=list)
 
 
 @dataclass
@@ -69,7 +80,11 @@ _MED_ATTR_KEYS = {
     "frequency": ("frequency", "freq", "频次", "次数"),
     "route": ("route", "用法", "给药途径"),
     "quantity": ("quantity", "qty", "数量", "总量"),
+    "status": ("status", "状态", "是否停药"),
 }
+
+# 两条用药记录间隔超过这么久，就当作另一段疗程（常见供药周期都在 3 个月内）
+COURSE_GAP_DAYS = 90
 
 # 出院小结里描述术式的句子，用于补齐没有 procedure 类事实的病例
 _PROCEDURE_RE = re.compile(
@@ -130,6 +145,53 @@ def _latest_attr(entries: list[tuple[date, ClinicalFact]], field_name: str) -> s
         if value:
             return value
     return None
+
+
+def _split_courses(entries: list[tuple[date, ClinicalFact]]) -> list[dict]:
+    """把同一味药的记录切成若干段用药期。
+
+    数据库里没有"这次疗程结束"的字段，只能看记录之间的间隔：
+    同一段连续开药的记录间隔通常在一个供药周期内，隔了三个月再开是另一段疗程。
+    """
+    courses: list[dict] = []
+    current: list[tuple[date, ClinicalFact]] = []
+    for entry in entries:
+        d, fact = entry
+        # 写了停药的记录是这一段的结尾，不管隔多久都不算新开一段
+        closes = (_med_attr(fact, "status") or "").lower() in ("stopped", "discontinued")
+        if (
+            current
+            and not closes
+            and d != date.min
+            and current[-1][0] != date.min
+            and (d - current[-1][0]).days > COURSE_GAP_DAYS
+        ):
+            courses.append(_finish_course(current))
+            current = []
+        current.append(entry)
+        if closes:
+            courses.append(_finish_course(current))
+            current = []
+    if current:
+        courses.append(_finish_course(current))
+    return courses
+
+
+def _finish_course(entries: list[tuple[date, ClinicalFact]]) -> dict:
+    dated = [(d, fact) for d, fact in entries if d != date.min]
+    status = None
+    for _, fact in reversed(entries):
+        value = _med_attr(fact, "status")
+        if value:
+            status = value.lower()
+            break
+    if not dated:
+        return {"since": None, "until": None, "last": None, "records": len(entries), "status": status}
+    since = dated[0][0].isoformat()
+    last = dated[-1][0].isoformat()
+    # until 只表示明确的结束日期；没有停药记录时留空，单次记录也一样
+    until = last if status in ("stopped", "discontinued") else None
+    return {"since": since, "until": until, "last": last, "records": len(dated), "status": status}
 
 
 def _parse_date(value) -> date | None:
@@ -250,7 +312,7 @@ def aggregate_context(
             delta_pct=delta,
         ))
 
-    # 折叠用药：按 drug 分组，取最新的一条状态
+    # 折叠用药：同一味药按记录日期切疗程，中间停超过 COURSE_GAP_DAYS 就算另一段
     med_by_drug: dict[str, list[tuple[date, ClinicalFact]]] = {}
     for fact in medications:
         d = _parse_date(fact.time.start)
@@ -260,21 +322,21 @@ def aggregate_context(
     active_meds: list[MedicationState] = []
     for drug, entries in med_by_drug.items():
         entries.sort(key=lambda x: x[0])
+        courses = _split_courses(entries)
         latest = entries[-1][1]
-        status = latest.attributes.get("status", "active")
-        dose = _latest_attr(entries, "dose")
-        stopped = None
-        if status == "stopped" or status == "discontinued":
-            stopped = entries[-1][0].isoformat()
+        latest_course = courses[-1]
+        # 只有最后一段明确写了停药，才算这味药已停
+        stopped = latest_course["until"] if latest_course["status"] in ("stopped", "discontinued") else None
         active_meds.append(MedicationState(
             drug=drug,
-            dose=dose,
-            since=entries[0][0].isoformat() if entries[0][0] != date.min else None,
+            dose=_latest_attr(entries, "dose"),
+            since=courses[0]["since"],
             stopped=stopped,
             fact_id=latest.fact_id,
             frequency=_latest_attr(entries, "frequency"),
             route=_latest_attr(entries, "route"),
             quantity=_latest_attr(entries, "quantity"),
+            courses=[MedicationCourse(**course) for course in courses],
         ))
 
     # recent_events 简单去重

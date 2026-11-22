@@ -426,6 +426,7 @@ export type CitationCheck = {
   mismatched_values?: CitationMismatch[];
   mismatch_count?: number;
   lookup_conflict?: LookupConflict | null;
+  advice_flags?: string[];
 };
 
 export type ConversationSummary = {

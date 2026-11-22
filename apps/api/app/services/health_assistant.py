@@ -21,12 +21,16 @@ from .series_aggregator import aggregate_context
 
 
 SYSTEM_PROMPT = (
-    "你是 HealthApp 的纵向健康分析助手。"
-    "你只能使用提供给你的结构化 JSON 上下文回答问题。"
-    "禁止编造上下文中没有的检验数值、诊断或用药。"
-    "每个具体数值后面必须标注对应的 [fact_id]，例如'肌酐 96 μmol/L [f_xxx]'。"
+    "你是 HealthApp 的纵向健康分析助手。回答分两层，写法要分开。\n"
+    "第一层，患者档案：检验数值、诊断、用药、手术、症状只能来自上下文 JSON。"
+    "每个具体数值后面标对应的 [fact_id]，例如'肌酐 96 μmol/L [f_xxx]'。"
+    "上下文里没有的记录不许补，也不许把常识说成档案里的结论。\n"
+    "第二层，通用医学常识：用来解释指标含义、说明一般处理原则、补充建议时可以写，"
+    "但必须单独成段，并写明'以下是通用医学常识，不针对你的具体病情'；"
+    "不写具体指南名称或版本号，不给精确的百分比数字（如'五年生存率 70%'），"
+    "只给定性判断，同时说明适用条件、与你档案情况的差异、还存在哪些不确定。\n"
     "涉及诊断、手术史、症状、影像报告等问题时，参考 clinical_notes 与 recent_events 字段。"
-    "问'有没有做过某台手术''有没有吃过某种药''吃了多久'时，以 lookup_result 为准："
+    "问'有没有做过某台手术''有没有吃过某种药'时，以 lookup_result 为准："
     "matched 非空就只能引用 matched 里的条目，并标 [fact_id]；没有 fact_id 的叙述性记录标它的事件 id，"
     "如 [evt_xxx]；"
     "matched 为空必须明说档案里没有找到相关记录，不能用常识或推测补充；"
@@ -34,18 +38,22 @@ SYSTEM_PROMPT = (
     "问'我的用药情况怎么样''我用过哪些药'这类清单问题时，lookup_result 的 mode 是 list，"
     "要把 matched 里的药全部列出（药名、剂量、频次、起止时间、是否还在用），不要只挑一两味；"
     "清单里只能出现 lookup_result 或 active_medications 里的药名，档案里没有的药不能补进去。"
-    "引用标签只能是记录 id（fact_id 或事件 id），不要把 lookup_result 这类字段名写成方括号标签。"
+    "问吃了多久时，按 duration_text 的说法讲，并且分开说两件事："
+    "用药期是从哪天到哪天、一共多久；实际服药天数是按频次换算的（比如两天吃一次，等于用药期的一半）。"
+    "有多段用药期就一段一段讲，不要把中间的空档算成一直在吃。"
+    "引用标签只能是记录 id（fact_id 或事件 id），不要把 lookup_result 这类字段名写成方括号标签，"
+    "正文里也不要直接念字段名（data_gaps、active_medications 之类），用'档案里缺什么'这样的说法。"
     "如果上下文里没有相关数据，直接说明，不要猜测。"
-    "回答用简体中文，分小节写，简洁清楚。"
+    "回答用简体中文，分小节写，简洁清楚。\n"
     "\n"
-    "当数据不足以给出明确结论时，不要只说'材料不足'。你要像一个医生看报告一样："
-    "(1)先说你看到了什么异常或可疑之处，并基于现有数据给出你能给出的判断；"
-    "(2)再说要确认判断还缺什么关键检查或指标（参考 data_gaps 字段）；"
-    "(3)指出已有数据本身有什么问题（参考 data_quality_issues 字段，比如缺日期、缺单位、OCR识别错误），"
-    "建议用户在时间轴上补充或修正这些信息；"
-    "(4)最后具体建议用户补充上传什么检查报告或去医院做什么检查。"
-    "如果数据已经足够，就直接给结论，不要额外要求用户做检查。"
-    "即使数据不全，也要先给出基于现有数据的初步判断，不要陷入只索要材料而不给结论。"
+    "问'要不要做某手术''该不该用某药''这种情况怎么办'这类问题时，按这个顺序写："
+    "(1)先看档案里有没有相关的诊断、检查、既往手术或用药，说清现有记录支持什么、还缺什么；"
+    "(2)再给通用层面的考量，比如适应证、风险、替代方案，这一段标成通用医学常识；"
+    "(3)说明每个人情况不同、这些不能替代面诊，把不确定的地方讲出来。"
+    "不要只回一句'资料不足'，也不要把通用常识直接写成对这位患者下的结论。\n"
+    "看指标时，像医生读报告：先说看到什么异常或可疑，再说要确认判断还缺什么检查（参考 data_gaps），"
+    "同时指出已有数据本身的问题（参考 data_quality_issues，比如缺日期、缺单位、OCR 识别错误），"
+    "最后建议补充什么材料。数据已经足够时直接给判断，不要额外索要检查。\n"
     "\n"
     "这是患者自助参考，不是医疗诊断，最后提醒一句'具体诊疗请咨询执业医生'。"
 )
@@ -133,6 +141,10 @@ def _build_context_payload(events, route_result, agg, gap_report, lookup=None) -
                 "quantity": m.quantity,
                 "since": m.since,
                 "stopped": m.stopped,
+                "courses": [
+                    {"since": c.since, "until": c.until, "records": c.records}
+                    for c in m.courses
+                ],
                 "fact_id": m.fact_id,
             }
             for m in agg.active_medications
@@ -330,6 +342,22 @@ def _mentions(name: str, answer: str) -> bool:
     return longest >= max(3, len(name) // 2)
 
 
+_AFFIRM_WORDS = {
+    "procedure": ("做过", "接受过", "实施过", "有过手术"),
+    "medication": ("吃过", "服用过", "吃过药", "一直在吃", "还在吃", "在服用"),
+}
+_DENY_WORDS = ("没有找到", "未找到", "没有相关记录", "没有这类记录", "未见", "查无")
+# 答案已经说明"只能当候选、需要确认"时，附带的列举不算肯定说法
+_HEDGE_RE = re.compile(r"没有完全对上|没有完全匹配|候选|需要.{0,4}确认|不确定|无法确认|待确认")
+
+
+def _sentence_around(text: str, index: int) -> str:
+    start = max(text.rfind(mark, 0, index) for mark in ("。", "；", "\n")) + 1
+    ends = [pos for pos in (text.find(mark, index) for mark in ("。", "；", "\n")) if pos != -1]
+    end = min(ends) if ends else len(text)
+    return text[start:end]
+
+
 def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
     """检索已经把答案查出来了，看答案有没有跟着走。
 
@@ -356,8 +384,17 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
         if not (cited & matched_ids) and not named:
             return {"kind": lookup["kind"], "reason": f"检索到 {len(matched)} 条记录，答案一条都没有提到"}
 
-    denies = re.search(r"(没有找到|未找到|没有相关记录|没有这类记录|未见|查无)", answer)
-    affirms = re.search(r"(确实|曾经|有过|做过|服用过|吃过|用过)", answer)
+    denies = re.search("|".join(_DENY_WORDS), answer)
+    affirm = None
+    for phrase in _AFFIRM_WORDS.get(lookup.get("kind"), ()):
+        for match in re.finditer(phrase, answer):
+            # 同一句里写着"只能算候选、需要确认"的，不算下了结论
+            if _HEDGE_RE.search(_sentence_around(answer, match.start())):
+                continue
+            affirm = phrase
+            break
+        if affirm:
+            break
 
     if matched:
         if not (cited & matched_ids) and not named:
@@ -366,9 +403,46 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
             return {"kind": lookup["kind"], "reason": "检索到记录，答案却说没有"}
         return None
 
-    if affirms and not denies:
-        return {"kind": lookup["kind"], "reason": "检索没有命中，答案却给出了肯定说法"}
+    if affirm and not denies:
+        return {"kind": lookup["kind"], "reason": f"检索没有命中，答案却给出了肯定说法：{affirm}"}
     return None
+
+
+_GUIDELINE_RE = re.compile(r"《[^》]{0,20}指南》|临床指南|诊治指南|专家共识|guideline", re.I)
+_RATE_CLAIM_RE = re.compile(
+    r"(生存率|存活率|成功率|有效率|复发率|发生率|风险|概率)[^。；\n]{0,10}?(\d+(?:\.\d+)?%|\d+(?:\.\d+)?成)"
+)
+_UNCERTAINTY_WORDS = (
+    "不确定", "因人而异", "个体差异", "取决于", "不能确定", "仅供参考",
+    "具体情况", "面诊", "需要医生", "视情况",
+)
+
+
+def check_advice_answer(answer: str, question_type: str | None) -> list[str]:
+    """建议类回答的粗检：允许写通用常识，但不许写成有出处的硬结论。
+
+    能查的只有三件事：有没有点名具体指南、有没有给没有记录支撑的比例、
+    有没有交代不确定性。查不出"常识本身对不对"，那要靠人看。
+    """
+    if question_type != "advice":
+        return []
+
+    flags: list[str] = []
+    if _GUIDELINE_RE.search(answer):
+        flags.append("回答点名了具体指南或共识，档案里没有这类依据可核对")
+
+    unsupported: list[str] = []
+    for match in _RATE_CLAIM_RE.finditer(answer):
+        # 挨着 [fact_id] 的数字属于患者档案，不算编造
+        if _FACT_ID_RE.search(answer[max(0, match.start() - 10): match.end() + 8]):
+            continue
+        unsupported.append(match.group(0).strip())
+    if unsupported:
+        flags.append("回答给了没有记录支撑的比例或概率：" + "、".join(dict.fromkeys(unsupported)))
+
+    if not any(word in answer for word in _UNCERTAINTY_WORDS):
+        flags.append("建议类回答没有说明不确定性和适用条件")
+    return flags
 
 
 def compute_confidence(
@@ -452,7 +526,7 @@ async def _prepare(
         {
             "role": "user",
             "content": (
-                "结构化患者上下文如下，请只基于它回答后面的问题。\n\n"
+                "结构化患者上下文如下。档案事实以它为准；通用医学常识按系统说明单独成段写。\n\n"
                 f"CONTEXT_JSON:\n{context_json}\n\n"
                 f"患者问题：{question}"
             ),
@@ -489,6 +563,9 @@ async def answer_question(
     lookup_check = check_lookup_consistency(answer, context_payload.get("lookup_result"))
     if lookup_check:
         citations["lookup_conflict"] = lookup_check
+    advice_flags = check_advice_answer(answer, context_payload.get("question_type"))
+    if advice_flags:
+        citations["advice_flags"] = advice_flags
     confidence = compute_confidence(context_payload, citations)
     answer = answer + confidence_footer(confidence)
 
@@ -547,6 +624,9 @@ async def answer_question_stream(
     lookup_check = check_lookup_consistency(full_answer, context_payload.get("lookup_result"))
     if lookup_check:
         citations["lookup_conflict"] = lookup_check
+    advice_flags = check_advice_answer(full_answer, context_payload.get("question_type"))
+    if advice_flags:
+        citations["advice_flags"] = advice_flags
     confidence = compute_confidence(context_payload, citations)
     footer = confidence_footer(confidence)
     full_answer = full_answer + footer
