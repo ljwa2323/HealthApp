@@ -349,13 +349,15 @@ _AFFIRM_WORDS = {
 _DENY_WORDS = ("没有找到", "未找到", "没有相关记录", "没有这类记录", "未见", "查无")
 # 答案已经说明"只能当候选、需要确认"时，附带的列举不算肯定说法
 _HEDGE_RE = re.compile(r"没有完全对上|没有完全匹配|候选|需要.{0,4}确认|不确定|无法确认|待确认")
+# 肯定词前面有否定词，是"不能确认你做过"这种写法，不算下结论
+_NEGATION_RE = re.compile(r"不能|无法|没有|未见|并非|不确定|难以|存疑|是否")
 
 
 def _sentence_around(text: str, index: int) -> str:
     start = max(text.rfind(mark, 0, index) for mark in ("。", "；", "\n")) + 1
     ends = [pos for pos in (text.find(mark, index) for mark in ("。", "；", "\n")) if pos != -1]
     end = min(ends) if ends else len(text)
-    return text[start:end]
+    return text[start:end], start
 
 
 def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
@@ -388,8 +390,12 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
     affirm = None
     for phrase in _AFFIRM_WORDS.get(lookup.get("kind"), ()):
         for match in re.finditer(phrase, answer):
+            sentence, sentence_start = _sentence_around(answer, match.start())
             # 同一句里写着"只能算候选、需要确认"的，不算下了结论
-            if _HEDGE_RE.search(_sentence_around(answer, match.start())):
+            if _HEDGE_RE.search(sentence):
+                continue
+            # 肯定词前面有否定词，比如"不能确认你做过""是否做过还没核实"
+            if _NEGATION_RE.search(sentence[: match.start() - sentence_start]):
                 continue
             affirm = phrase
             break
