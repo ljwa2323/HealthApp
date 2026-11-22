@@ -57,6 +57,7 @@ class Intent:
     time_start: date | None = None
     time_end: date | None = None
     matched_concepts: list[str] = field(default_factory=list)
+    retrieval: dict | None = None
     raw: dict = field(default_factory=dict)
 
 
@@ -80,7 +81,18 @@ ROUTER_SYSTEM = (
     "- time_start / time_end: ISO 日期 YYYY-MM-DD。用户说'近半年'就从今天往前推 6 个月；"
     "说'最近三个月'就推 3 个月；说'今年'就从 1 月 1 日开始；没提时间就都给 null。\n"
     "- matched_concepts: 用户问题里提到的具体指标名（中文），比如 ['肌酐', 'eGFR']。"
-    "没提到具体指标就给空数组。\n\n"
+    "没提到具体指标就给空数组。\n"
+    "- retrieval: 需要先做确定性检索时给出一个对象，否则给 null。字段为 "
+    "need_lookup(true) / kind(medication 用药 或 procedure 手术) / "
+    "mode(presence 问有没有、list 要清单、duration 问时长) / "
+    "hint(用户说出的药名或术式关键词，没提就给空字符串) / scope(all 含已停用，active 只要还在吃的)。\n"
+    "  例：'我的用药情况怎么样' -> {{\"need_lookup\": true, \"kind\": \"medication\", \"mode\": \"list\", "
+    "\"hint\": \"\", \"scope\": \"all\"}}；\n"
+    "  例：'我有没有吃过肝泰乐，吃了多久' -> {{\"need_lookup\": true, \"kind\": \"medication\", "
+    "\"mode\": \"duration\", \"hint\": \"肝泰乐\", \"scope\": \"all\"}}；\n"
+    "  例：'我有没有做过手术' -> {{\"need_lookup\": true, \"kind\": \"procedure\", \"mode\": \"presence\", "
+    "\"hint\": \"\", \"scope\": \"all\"}}；\n"
+    "  例：'我的肝功能怎么样' -> null。\n\n"
     "今天是 {today}。"
 )
 
@@ -145,5 +157,30 @@ async def route_question(question: str, *, today: date | None = None) -> Intent:
         time_start=_parse_date(data.get("time_start")),
         time_end=_parse_date(data.get("time_end")),
         matched_concepts=[c for c in data.get("matched_concepts", []) if isinstance(c, str)][:10],
+        retrieval=_parse_retrieval(data.get("retrieval")),
         raw=data,
     )
+
+
+def _parse_retrieval(raw) -> dict | None:
+    """路由给的检索计划只接受白名单值，坏字段就地丢掉，不往下传。"""
+    if not isinstance(raw, dict) or not raw.get("need_lookup"):
+        return None
+    kind = raw.get("kind")
+    if kind not in ("medication", "procedure"):
+        return None
+    mode = raw.get("mode") or "presence"
+    if mode not in ("presence", "list", "duration"):
+        mode = "presence"
+    scope = raw.get("scope")
+    if scope not in ("all", "active"):
+        scope = "all"
+    hint = raw.get("hint")
+    hint = hint.strip()[:40] if isinstance(hint, str) else ""
+    return {
+        "need_lookup": True,
+        "kind": kind,
+        "mode": mode,
+        "hint": hint,
+        "scope": scope,
+    }

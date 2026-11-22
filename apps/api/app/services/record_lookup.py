@@ -132,8 +132,8 @@ def _procedure_keyword(question: str) -> str | None:
     return text if len(text) >= 2 else None
 
 
-def lookup_procedures(agg: AggregatedContext, question: str) -> dict:
-    keyword = _procedure_keyword(question)
+def lookup_procedures(agg: AggregatedContext, question: str, keyword: str | None = None) -> dict:
+    keyword = keyword if keyword is not None else _procedure_keyword(question)
     matched = []
     for record in agg.procedures:
         if keyword and keyword not in record.name:
@@ -166,8 +166,25 @@ def lookup_procedures(agg: AggregatedContext, question: str) -> dict:
     return result
 
 
-def lookup_medications(agg: AggregatedContext, question: str, today: date) -> dict:
-    hint = extract_drug_hint(question)
+def _med_item(med, today: date) -> dict:
+    duration = _duration(med.since, med.stopped, today)
+    return {
+        "drug": med.drug,
+        "dose": med.dose,
+        "frequency": med.frequency,
+        "route": med.route,
+        "quantity": med.quantity,
+        "since": med.since,
+        "stopped": med.stopped,
+        "duration_days": duration["days"],
+        "duration_text": duration["text"],
+        "ongoing": duration["ongoing"],
+        "fact_id": med.fact_id,
+    }
+
+
+def lookup_medications(agg: AggregatedContext, question: str, today: date, hint: str | None = None) -> dict:
+    hint = extract_drug_hint(question) if hint is None else hint
     variants = _hint_variants(hint)
 
     scored = []
@@ -179,22 +196,10 @@ def lookup_medications(agg: AggregatedContext, question: str, today: date) -> di
                 best = (score, kind)
         if best[0] <= 0:
             continue
-        duration = _duration(med.since, med.stopped, today)
-        scored.append({
-            "drug": med.drug,
-            "dose": med.dose,
-            "frequency": med.frequency,
-            "route": med.route,
-            "quantity": med.quantity,
-            "since": med.since,
-            "stopped": med.stopped,
-            "duration_days": duration["days"],
-            "duration_text": duration["text"],
-            "ongoing": duration["ongoing"],
-            "fact_id": med.fact_id,
-            "score": round(best[0], 2),
-            "match": best[1],
-        })
+        item = _med_item(med, today)
+        item["score"] = round(best[0], 2)
+        item["match"] = best[1]
+        scored.append(item)
 
     scored.sort(key=lambda item: item["score"], reverse=True)
 
@@ -223,6 +228,7 @@ def lookup_medications(agg: AggregatedContext, question: str, today: date) -> di
 
 
 def lookup_records(question: str, agg: AggregatedContext, *, today: date | None = None) -> dict | None:
+    """正则兜底：路由没有给检索计划时用，判断依据是问句本身。"""
     today = today or date.today()
     request = detect_lookup(question)
     if not request:
@@ -230,6 +236,96 @@ def lookup_records(question: str, agg: AggregatedContext, *, today: date | None 
     if request["kind"] == "procedure":
         return lookup_procedures(agg, question)
     return lookup_medications(agg, question, today)
+
+
+_MED_FIELDS = ("dose", "frequency", "route", "quantity", "since")
+
+
+def lookup_medication_list(agg: AggregatedContext, *, scope: str = "all", today: date) -> dict:
+    """用药清单：不问某一种药，而是把档案里记过的药全部列出来。"""
+    items = [_med_item(med, today) for med in agg.active_medications]
+    if scope == "active":
+        items = [item for item in items if item["ongoing"]]
+    items.sort(key=lambda item: item["since"] or "", reverse=True)
+
+    missing = {f: sum(1 for item in items if not item.get(f)) for f in _MED_FIELDS}
+    result = {
+        "kind": "medication",
+        "mode": "list",
+        "scope": scope,
+        "matched": items,
+        "matched_count": len(items),
+        "total_in_file": len(agg.active_medications),
+        "missing_fields": {k: v for k, v in missing.items() if v},
+    }
+    if not items:
+        result["note"] = "档案里的用药都已停用" if agg.active_medications else "档案里没有用药记录"
+    return result
+
+
+def lookup_procedure_list(agg: AggregatedContext) -> dict:
+    matched = [
+        {
+            "name": record.name,
+            "date": record.date,
+            "institution": record.institution,
+            "source": record.source,
+            "fact_id": record.fact_id,
+            "event_id": record.event_id,
+        }
+        for record in agg.procedures
+    ]
+    result = {
+        "kind": "procedure",
+        "mode": "list",
+        "matched": matched,
+        "matched_count": len(matched),
+        "total_in_file": len(agg.procedures),
+    }
+    if not matched:
+        result["note"] = "档案里没有手术相关记录"
+    return result
+
+
+LOOKUP_KINDS = ("medication", "procedure")
+LOOKUP_MODES = ("presence", "list", "duration")
+
+
+def lookup_by_plan(plan: dict | None, agg: AggregatedContext, *, today: date | None = None) -> dict | None:
+    """按路由给出的检索计划执行，不再从问句里猜要不要查。"""
+    if not plan or not plan.get("need_lookup"):
+        return None
+    kind = plan.get("kind")
+    mode = plan.get("mode") or "presence"
+    if kind not in LOOKUP_KINDS or mode not in LOOKUP_MODES:
+        return None
+
+    today = today or date.today()
+    hint = (plan.get("hint") or "").strip()
+    scope = plan.get("scope") or "all"
+
+    if kind == "procedure":
+        if mode == "list" and not hint:
+            return lookup_procedure_list(agg)
+        return lookup_procedures(agg, "", keyword=hint or None)
+    if mode == "list" and not hint:
+        return lookup_medication_list(agg, scope=scope, today=today)
+    return lookup_medications(agg, "", today, hint=hint)
+
+
+def lookup_drug_names(result: dict | None) -> list[str]:
+    """检索结果里出现过的药名（含候选），用于核对答案有没有提到档案外的药。"""
+    if not result or result.get("kind") != "medication":
+        return []
+    names = []
+    for item in (result.get("matched") or []) + (result.get("candidates") or []):
+        if item.get("drug"):
+            names.append(_norm_drug(item["drug"]))
+    return [name for name in dict.fromkeys(names) if name]
+
+
+def normalize_drug(name: str) -> str:
+    return _norm_drug(name)
 
 
 def lookup_fact_ids(result: dict | None) -> list[str]:

@@ -9,7 +9,13 @@ from openai import AsyncOpenAI
 from ..config import get_deepseek_api_key
 from .gap_extractor import extract_data_gaps
 from .intent_router import route_question
-from .record_lookup import lookup_fact_ids, lookup_records
+from .record_lookup import (
+    lookup_by_plan,
+    lookup_drug_names,
+    lookup_fact_ids,
+    lookup_records,
+    normalize_drug,
+)
 from .series_aggregator import aggregate_context
 
 
@@ -24,6 +30,9 @@ SYSTEM_PROMPT = (
     "如 [evt_xxx]；"
     "matched 为空必须明说档案里没有找到相关记录，不能用常识或推测补充；"
     "只有 candidates 没有 matched 时，把候选药名列出来让用户确认是哪一种，不要自行选定一个当作答案。"
+    "问'我的用药情况怎么样''我用过哪些药'这类清单问题时，lookup_result 的 mode 是 list，"
+    "要把 matched 里的药全部列出（药名、剂量、频次、起止时间、是否还在用），不要只挑一两味；"
+    "清单里只能出现 lookup_result 或 active_medications 里的药名，档案里没有的药不能补进去。"
     "引用标签只能是记录 id（fact_id 或事件 id），不要把 lookup_result 这类字段名写成方括号标签。"
     "如果上下文里没有相关数据，直接说明，不要猜测。"
     "回答用简体中文，分小节写，简洁清楚。"
@@ -59,6 +68,14 @@ _NON_CITABLE_TOKENS = {
     "recent_events", "procedures", "active_medications", "series",
     "observed_concepts", "panel_known", "fact_id", "event_id", "context",
 }
+
+# 带剂型后缀的词当药名看，用来发现"档案里没有却写进答案"的药
+_DRUG_FORM_RE = re.compile(
+    r"([\u4e00-\u9fa5A-Za-z0-9]{2,12}(?:缓释片|控释片|肠溶片|分散片|咀嚼片|胶囊|颗粒|"
+    r"口服液|注射液|滴眼液|乳膏|软膏|糖浆|片|丸))"
+)
+_GENERIC_FORM_WORDS = {"药片", "片剂", "胶囊剂", "颗粒剂", "药物", "药品", "中成药", "西药", "口服药"}
+_ADVICE_WORDS = ("建议", "可以", "考虑", "推荐", "如需", "必要时", "可尝试", "应服用", "也可")
 
 
 def _client() -> AsyncOpenAI:
@@ -266,11 +283,36 @@ def validate_citations(
     }
 
 
+def _matches_allowed_drug(mentioned: str, allowed: set[str]) -> bool:
+    """抽取出来的词可能带着前面的动词（"你在用肝泰乐片"），按包含关系比。"""
+    norm = normalize_drug(mentioned)
+    if not norm:
+        return True
+    if norm in allowed:
+        return True
+    return any(name and (name in norm or norm in name) for name in allowed)
+
+
+def _drugs_in_answer(answer: str) -> list[str]:
+    """从答案里挑出像药名的词（带剂型后缀），用来核对有没有提到档案外的药。"""
+    found = []
+    for match in _DRUG_FORM_RE.finditer(answer):
+        name = match.group(1)
+        if name in _GENERIC_FORM_WORDS:
+            continue
+        near = answer[max(0, match.start() - 15): match.end() + 15]
+        if any(word in near for word in _ADVICE_WORDS):
+            continue  # 建议/推荐里提到的药不算"记录里没有"
+        found.append(name)
+    return found
+
+
 def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
     """检索已经把答案查出来了，看答案有没有跟着走。
 
-    两种情况都算没跟：检索有命中、答案却没引用也没提到；检索没命中、
-    答案却给了肯定说法（"你确实做过""你一直在吃"）。
+    三种情况都算没跟：检索有命中、答案却没引用也没提到；检索没命中、
+    答案却给了肯定说法（"你确实做过""你一直在吃"）；答案提到了档案里
+    根本没有的药名。
     """
     if not lookup:
         return None
@@ -280,6 +322,16 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
     cited = set(_FACT_ID_RE.findall(answer))
     names = [item.get("name") or item.get("drug") or "" for item in matched]
     named = any(name and name[:6] in answer for name in names)
+
+    if lookup.get("kind") == "medication":
+        allowed = {normalize_drug(n) for n in lookup_drug_names(lookup)}
+        for mentioned in _drugs_in_answer(answer):
+            if not _matches_allowed_drug(mentioned, allowed):
+                return {"kind": "medication", "reason": f"答案提到的药不在档案记录里：{mentioned}"}
+
+    if lookup.get("mode") == "list" and matched:
+        if not (cited & matched_ids) and not named:
+            return {"kind": lookup["kind"], "reason": f"检索到 {len(matched)} 条记录，答案一条都没有提到"}
 
     denies = re.search(r"(没有找到|未找到|没有相关记录|没有这类记录|未见|查无)", answer)
     affirms = re.search(r"(确实|曾经|有过|做过|服用过|吃过|用过)", answer)
@@ -363,7 +415,10 @@ async def _prepare(
         time_end=route.time_end,
     )
     gap_report = extract_data_gaps(events=events, topic=route.topic)
-    lookup = lookup_records(question, agg)
+    lookup = lookup_by_plan(getattr(route, "retrieval", None), agg)
+    if lookup is None:
+        # 路由没给计划（或字段不合法）时，用问句正则兜底
+        lookup = lookup_records(question, agg)
     context_payload = _build_context_payload(events, route, agg, gap_report, lookup)
     context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
     fact_values = _collect_fact_values(agg)
