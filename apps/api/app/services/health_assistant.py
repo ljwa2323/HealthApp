@@ -145,10 +145,13 @@ def _collect_fact_values(agg) -> dict[str, float | None]:
     for n in agg.clinical_notes:
         if n.get("fact_id"):
             values.setdefault(n["fact_id"], None)
-    # 叙述性记录没有 fact_id，只能按事件引用，事件 id 也可被引用
+    # 叙述性记录没有 fact_id，只能按事件引用；事件 id 一律可引用
     for p in agg.procedures:
         if p.event_id:
             values.setdefault(p.event_id, None)
+    for e in agg.recent_events:
+        if e.get("event_id"):
+            values.setdefault(e["event_id"], None)
     return values
 
 
