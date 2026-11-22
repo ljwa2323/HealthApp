@@ -295,7 +295,7 @@ def lookup_medications(agg: AggregatedContext, question: str, today: date, hint:
     variants = _hint_variants(hint)
 
     scored = []
-    for med in agg.active_medications:
+    for med in agg.medications:
         best = (0.0, "none")
         for variant in variants:
             score, kind = _drug_score(variant, med.drug)
@@ -321,12 +321,12 @@ def lookup_medications(agg: AggregatedContext, question: str, today: date, hint:
         "matched": matched,
         "candidates": candidates[:5],
         "matched_count": len(matched),
-        "total_in_file": len(agg.active_medications),
+        "total_in_file": len(agg.medications),
     }
     if not matched and not candidates:
         result["note"] = (
-            f"档案里的 {len(agg.active_medications)} 种药都不含'{hint}'"
-            if agg.active_medications and hint
+            f"档案里的 {len(agg.medications)} 种药都不含'{hint}'"
+            if agg.medications and hint
             else "档案里没有用药记录"
         )
     elif not matched and candidates:
@@ -350,7 +350,7 @@ _MED_FIELDS = ("dose", "frequency", "route", "quantity", "since")
 
 def lookup_medication_list(agg: AggregatedContext, *, scope: str = "all", today: date) -> dict:
     """用药清单：不问某一种药，而是把档案里记过的药全部列出来。"""
-    items = [_med_item(med, today) for med in agg.active_medications]
+    items = [_med_item(med, today) for med in agg.medications]
     if scope == "active":
         items = [item for item in items if item["ongoing"]]
     items.sort(key=lambda item: item["since"] or "", reverse=True)
@@ -362,11 +362,11 @@ def lookup_medication_list(agg: AggregatedContext, *, scope: str = "all", today:
         "scope": scope,
         "matched": items,
         "matched_count": len(items),
-        "total_in_file": len(agg.active_medications),
+        "total_in_file": len(agg.medications),
         "missing_fields": {k: v for k, v in missing.items() if v},
     }
     if not items:
-        result["note"] = "档案里的用药都已停用" if agg.active_medications else "档案里没有用药记录"
+        result["note"] = "档案里的用药都已停用" if agg.medications else "档案里没有用药记录"
     return result
 
 
@@ -412,9 +412,18 @@ def lookup_by_plan(plan: dict | None, agg: AggregatedContext, *, today: date | N
     scope = plan.get("scope") or "all"
 
     if kind == "procedure":
-        if mode == "list" and not hint:
-            return lookup_procedure_list(agg)
-        return lookup_procedures(agg, "", keyword=hint or None)
+        # 手术没有"在用/已停"这个概念，scope 一律按全部记录查，但要写回结果，
+        # 免得传了 active 却什么都不发生、调用方还以为过滤生效了
+        result = (
+            lookup_procedure_list(agg)
+            if mode == "list" and not hint
+            else lookup_procedures(agg, "", keyword=hint or None)
+        )
+        result["scope"] = "all"
+        if scope == "active":
+            note = "手术记录没有在用/停用的区分，按全部记录查"
+            result["note"] = f"{result['note']}；{note}" if result.get("note") else note
+        return result
     if not hint:
         # 问"用过哪些药"却没给药名，只能列清单；按空线索匹配会把每种药都判成 0 分
         return lookup_medication_list(agg, scope=scope, today=today)

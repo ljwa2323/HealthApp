@@ -38,7 +38,7 @@ SYSTEM_PROMPT = (
     "有 matched 就只引用 matched 里的条目并标 id，叙述性记录标事件 id（如 [evt_xxx]）；"
     "matched 为空直说档案里没查到；只有 candidates 时把候选列出来让用户确认，不要替用户认定。"
     "问'我的用药情况怎么样'这类清单时把 matched 里的药全部列出（药名、剂量频次、起止、是否还在用），"
-    "答案里的药名只能来自 lookup_result 或 active_medications。"
+    "答案里的药名只能来自 lookup_result 或 medications。"
     "讲时长按 duration_text：先说服药期多久，再说按频次折算的服药天数；"
     "多段就分段说，中间空档不算在吃药。\n"
     "\n"
@@ -65,7 +65,7 @@ _RANGE_HINTS = ("参考", "正常", "范围", "上限", "下限", "高于", "低
 # 这类不是记录 id，计入幻觉会让前端误报，直接忽略。
 _NON_CITABLE_TOKENS = {
     "lookup_result", "data_gaps", "data_quality_issues", "clinical_notes",
-    "recent_events", "procedures", "active_medications", "series",
+    "recent_events", "procedures", "medications", "active_medications", "series",
     "observed_concepts", "panel_known", "fact_id", "event_id", "context",
 }
 
@@ -126,7 +126,7 @@ def _build_context_payload(events, route_result, agg, gap_report, lookup=None) -
             "end": route_result.time_end.isoformat() if route_result.time_end else None,
         },
         "series": series_json,
-        "active_medications": [
+        "medications": [
             {
                 "drug": m.drug,
                 "dose": m.dose,
@@ -141,7 +141,7 @@ def _build_context_payload(events, route_result, agg, gap_report, lookup=None) -
                 ],
                 "fact_id": m.fact_id,
             }
-            for m in agg.active_medications
+            for m in agg.medications
         ],
         "procedures": [
             {
@@ -170,7 +170,7 @@ def _collect_fact_values(agg) -> dict[str, float | None]:
     for s in agg.series:
         for p in s.points:
             values[p.fact_id] = p.v
-    for m in agg.active_medications:
+    for m in agg.medications:
         # 同一味药有开头、停药多条记录，模型引哪一条都该算合法
         for fact_id in (m.fact_ids or [m.fact_id]):
             if fact_id:

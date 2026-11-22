@@ -67,10 +67,16 @@ class ProcedureRecord:
 @dataclass
 class AggregatedContext:
     series: list[Series] = field(default_factory=list)
-    active_medications: list[MedicationState] = field(default_factory=list)
+    # 档案里记过的所有药，含已停用的；判断"还在吃"用 ongoing_medications
+    medications: list[MedicationState] = field(default_factory=list)
     recent_events: list[dict] = field(default_factory=list)
     clinical_notes: list[dict] = field(default_factory=list)
     procedures: list[ProcedureRecord] = field(default_factory=list)
+
+    @property
+    def ongoing_medications(self) -> list[MedicationState]:
+        """还在吃的药。没有停药日期的算在用。"""
+        return [m for m in self.medications if not m.stopped]
 
 
 CLINICAL_NOTE_KINDS = {"condition", "procedure", "symptom", "note"}
@@ -257,7 +263,7 @@ def aggregate_context(
     """
     把 events 聚合成给 LLM 看的聚焦上下文：
     - series: 按 concept 分组的时间序列（只保留时间窗内的 observation）
-    - active_medications: 折叠后的当前用药
+    - medications: 折叠后的用药，含已停用的；在用视图是 ongoing_medications
     - recent_events: 事件级骨架
     """
     events = list(events)
@@ -320,7 +326,7 @@ def aggregate_context(
         drug = fact.concept.display or "unknown"
         med_by_drug.setdefault(drug, []).append((d or date.min, fact))
 
-    active_meds: list[MedicationState] = []
+    med_states: list[MedicationState] = []
     for drug, entries in med_by_drug.items():
         entries.sort(key=lambda x: x[0])
         courses = _split_courses(entries)
@@ -328,7 +334,7 @@ def aggregate_context(
         latest_course = courses[-1]
         # 只有最后一段明确写了停药，才算这味药已停
         stopped = latest_course["until"] if latest_course["status"] in ("stopped", "discontinued") else None
-        active_meds.append(MedicationState(
+        med_states.append(MedicationState(
             drug=drug,
             dose=_latest_attr(entries, "dose"),
             since=courses[0]["since"],
@@ -437,7 +443,7 @@ def aggregate_context(
 
     return AggregatedContext(
         series=series_list,
-        active_medications=active_meds,
+        medications=med_states,
         recent_events=recent_events,
         clinical_notes=clinical_notes,
         procedures=procedures,
