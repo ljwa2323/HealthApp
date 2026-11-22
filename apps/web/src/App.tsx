@@ -2594,7 +2594,8 @@ function UploadPage({
 function CitationNotice({ check }: { check?: CitationCheck | null }) {
   const mismatches = check?.mismatched_values ?? [];
   const hallucinated = check?.hallucinated_citations ?? [];
-  if (mismatches.length === 0 && hallucinated.length === 0) return null;
+  const conflict = check?.lookup_conflict;
+  if (mismatches.length === 0 && hallucinated.length === 0 && !conflict) return null;
   return (
     <div className="citation-warning">
       <strong>这段回答的引用与记录不一致，请对照原报告核对</strong>
@@ -2606,6 +2607,11 @@ function CitationNotice({ check }: { check?: CitationCheck | null }) {
         ))}
         {hallucinated.length > 0 && (
           <li>回答引用了不存在的记录：{hallucinated.join("、")}</li>
+        )}
+        {conflict && (
+          <li>
+            {conflict.kind === "procedure" ? "手术记录" : "用药记录"}：{conflict.reason}
+          </li>
         )}
       </ul>
     </div>

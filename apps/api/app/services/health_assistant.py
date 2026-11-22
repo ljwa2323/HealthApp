@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from ..config import get_deepseek_api_key
 from .gap_extractor import extract_data_gaps
 from .intent_router import route_question
+from .record_lookup import lookup_fact_ids, lookup_records
 from .series_aggregator import aggregate_context
 
 
@@ -18,6 +19,12 @@ SYSTEM_PROMPT = (
     "禁止编造上下文中没有的检验数值、诊断或用药。"
     "每个具体数值后面必须标注对应的 [fact_id]，例如'肌酐 96 μmol/L [f_xxx]'。"
     "涉及诊断、手术史、症状、影像报告等问题时，参考 clinical_notes 与 recent_events 字段。"
+    "问'有没有做过某台手术''有没有吃过某种药''吃了多久'时，以 lookup_result 为准："
+    "matched 非空就只能引用 matched 里的条目，并标 [fact_id]；没有 fact_id 的叙述性记录标它的事件 id，"
+    "如 [evt_xxx]；"
+    "matched 为空必须明说档案里没有找到相关记录，不能用常识或推测补充；"
+    "只有 candidates 没有 matched 时，把候选药名列出来让用户确认是哪一种，不要自行选定一个当作答案。"
+    "引用标签只能是记录 id（fact_id 或事件 id），不要把 lookup_result 这类字段名写成方括号标签。"
     "如果上下文里没有相关数据，直接说明，不要猜测。"
     "回答用简体中文，分小节写，简洁清楚。"
     "\n"
@@ -45,6 +52,14 @@ _NUM_PAIR_RE = re.compile(r"(-?\d+(?:\.\d+)?)([^\n\[\]，,。；;、（）()]{0,
 # Words that mark the neighbouring number as a threshold rather than a result.
 _RANGE_HINTS = ("参考", "正常", "范围", "上限", "下限", "高于", "低于", "超过")
 
+# 模型偶尔会把 payload 的字段名当成引用标签写出来（"[lookup_result]"），
+# 这类不是记录 id，计入幻觉会让前端误报，直接忽略。
+_NON_CITABLE_TOKENS = {
+    "lookup_result", "data_gaps", "data_quality_issues", "clinical_notes",
+    "recent_events", "procedures", "active_medications", "series",
+    "observed_concepts", "panel_known", "fact_id", "event_id", "context",
+}
+
 
 def _client() -> AsyncOpenAI:
     api_key = get_deepseek_api_key()
@@ -58,7 +73,7 @@ def _client() -> AsyncOpenAI:
     )
 
 
-def _build_context_payload(events, route_result, agg, gap_report) -> dict[str, Any]:
+def _build_context_payload(events, route_result, agg, gap_report, lookup=None) -> dict[str, Any]:
     series_json = []
     for s in agg.series:
         series_json.append({
@@ -85,11 +100,32 @@ def _build_context_payload(events, route_result, agg, gap_report) -> dict[str, A
         },
         "series": series_json,
         "active_medications": [
-            {"drug": m.drug, "dose": m.dose, "since": m.since, "stopped": m.stopped, "fact_id": m.fact_id}
+            {
+                "drug": m.drug,
+                "dose": m.dose,
+                "frequency": m.frequency,
+                "route": m.route,
+                "quantity": m.quantity,
+                "since": m.since,
+                "stopped": m.stopped,
+                "fact_id": m.fact_id,
+            }
             for m in agg.active_medications
+        ],
+        "procedures": [
+            {
+                "name": p.name,
+                "date": p.date,
+                "institution": p.institution,
+                "source": p.source,
+                "fact_id": p.fact_id,
+                "event_id": p.event_id,
+            }
+            for p in agg.procedures
         ],
         "recent_events": agg.recent_events,
         "clinical_notes": agg.clinical_notes,
+        "lookup_result": lookup,
         "data_gaps": gap_report.gaps,
         "data_quality_issues": detect_data_quality_issues(events) if events else [],
         "panel_known": gap_report.panel_known,
@@ -109,6 +145,10 @@ def _collect_fact_values(agg) -> dict[str, float | None]:
     for n in agg.clinical_notes:
         if n.get("fact_id"):
             values.setdefault(n["fact_id"], None)
+    # 叙述性记录没有 fact_id，只能按事件引用，事件 id 也可被引用
+    for p in agg.procedures:
+        if p.event_id:
+            values.setdefault(p.event_id, None)
     return values
 
 
@@ -180,7 +220,7 @@ def validate_citations(
     """
     allowed = set(allowed_fact_ids)
     cited = set(_FACT_ID_RE.findall(answer))
-    hallucinated = sorted(cited - allowed)
+    hallucinated = sorted(cited - allowed - _NON_CITABLE_TOKENS)
 
     mismatched: list[dict[str, Any]] = []
     if fact_values:
@@ -221,6 +261,36 @@ def validate_citations(
         "mismatched_values": mismatched,
         "mismatch_count": len(mismatched),
     }
+
+
+def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
+    """检索已经把答案查出来了，看答案有没有跟着走。
+
+    两种情况都算没跟：检索有命中、答案却没引用也没提到；检索没命中、
+    答案却给了肯定说法（"你确实做过""你一直在吃"）。
+    """
+    if not lookup:
+        return None
+
+    matched = lookup.get("matched") or []
+    matched_ids = set(lookup_fact_ids(lookup))
+    cited = set(_FACT_ID_RE.findall(answer))
+    names = [item.get("name") or item.get("drug") or "" for item in matched]
+    named = any(name and name[:6] in answer for name in names)
+
+    denies = re.search(r"(没有找到|未找到|没有相关记录|没有这类记录|未见|查无)", answer)
+    affirms = re.search(r"(确实|曾经|有过|做过|服用过|吃过|用过)", answer)
+
+    if matched:
+        if not (cited & matched_ids) and not named:
+            return {"kind": lookup["kind"], "reason": "检索到记录，但答案没有引用或提到它们"}
+        if denies and not named:
+            return {"kind": lookup["kind"], "reason": "检索到记录，答案却说没有"}
+        return None
+
+    if affirms and not denies:
+        return {"kind": lookup["kind"], "reason": "检索没有命中，答案却给出了肯定说法"}
+    return None
 
 
 def compute_confidence(
@@ -290,7 +360,8 @@ async def _prepare(
         time_end=route.time_end,
     )
     gap_report = extract_data_gaps(events=events, topic=route.topic)
-    context_payload = _build_context_payload(events, route, agg, gap_report)
+    lookup = lookup_records(question, agg)
+    context_payload = _build_context_payload(events, route, agg, gap_report, lookup)
     context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
     fact_values = _collect_fact_values(agg)
     used = list(fact_values)
@@ -334,6 +405,9 @@ async def answer_question(
     )
     answer = (completion.choices[0].message.content or "").strip()
     citations = validate_citations(answer, used, fact_values)
+    lookup_check = check_lookup_consistency(answer, context_payload.get("lookup_result"))
+    if lookup_check:
+        citations["lookup_conflict"] = lookup_check
     confidence = compute_confidence(context_payload, citations)
     answer = answer + confidence_footer(confidence)
 
@@ -389,6 +463,9 @@ async def answer_question_stream(
 
     full_answer = "".join(answer_parts).strip()
     citations = validate_citations(full_answer, used, fact_values)
+    lookup_check = check_lookup_consistency(full_answer, context_payload.get("lookup_result"))
+    if lookup_check:
+        citations["lookup_conflict"] = lookup_check
     confidence = compute_confidence(context_payload, citations)
     footer = confidence_footer(confidence)
     full_answer = full_answer + footer

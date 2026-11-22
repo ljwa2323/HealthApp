@@ -413,6 +413,11 @@ export type CitationMismatch = {
   record_value: number;
 };
 
+export type LookupConflict = {
+  kind: "procedure" | "medication" | string;
+  reason: string;
+};
+
 export type CitationCheck = {
   cited_fact_ids?: string[];
   allowed_fact_ids?: string[];
@@ -420,6 +425,7 @@ export type CitationCheck = {
   hallucination_count?: number;
   mismatched_values?: CitationMismatch[];
   mismatch_count?: number;
+  lookup_conflict?: LookupConflict | null;
 };
 
 export type ConversationSummary = {

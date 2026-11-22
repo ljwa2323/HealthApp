@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Iterable
@@ -35,6 +36,20 @@ class MedicationState:
     since: str | None
     stopped: str | None
     fact_id: str | None = None
+    frequency: str | None = None
+    route: str | None = None
+    quantity: str | None = None
+
+
+@dataclass
+class ProcedureRecord:
+    name: str
+    date: str | None
+    institution: str | None
+    source: str  # "fact" 来自 procedure 类事实，"narrative" 来自事件正文
+    fact_id: str | None = None
+    event_id: str | None = None
+    quote: str | None = None
 
 
 @dataclass
@@ -43,9 +58,78 @@ class AggregatedContext:
     active_medications: list[MedicationState] = field(default_factory=list)
     recent_events: list[dict] = field(default_factory=list)
     clinical_notes: list[dict] = field(default_factory=list)
+    procedures: list[ProcedureRecord] = field(default_factory=list)
 
 
 CLINICAL_NOTE_KINDS = {"condition", "procedure", "symptom", "note"}
+
+# 用药属性在不同来源里的写法不统一，第一条命中的就是取值
+_MED_ATTR_KEYS = {
+    "dose": ("dose", "dosage", "剂量"),
+    "frequency": ("frequency", "freq", "频次", "次数"),
+    "route": ("route", "用法", "给药途径"),
+    "quantity": ("quantity", "qty", "数量", "总量"),
+}
+
+# 出院小结里描述术式的句子，用于补齐没有 procedure 类事实的病例
+_PROCEDURE_RE = re.compile(
+    "|".join(
+        (
+            "手术", "切除", "置换", "置入", "吻合", "清创", "引流", "造瘘",
+            "腔镜", "开胸", "开腹", "搭桥", "起搏器", "支架植入",
+        )
+    )
+)
+_SENTENCE_SPLIT = re.compile(r"[。；;\n]")
+_CLAUSE_SPLIT = re.compile(r"[，,、]")
+
+
+def _procedure_clause(sentence: str) -> str:
+    """从"行腹腔镜阑尾切除术，术后恢复良好"里取术式那一小段。"""
+    for clause in _CLAUSE_SPLIT.split(sentence):
+        clause = clause.strip()
+        if clause and _PROCEDURE_RE.search(clause):
+            return (clause[1:] if clause.startswith("行") else clause).strip() or clause
+    return sentence.strip()
+
+# 手术记录被 OCR 拆成字段级事实时，只有名称类字段是术式，
+# 麻醉方式、术前术后诊断这些取出来会变成"做过全身麻醉"这种假记录
+_PROCEDURE_NAME_LABELS = ("手术名称", "术式", "手术", "操作")
+_NON_PROCEDURE_LABELS = (
+    "麻醉", "诊断", "日期", "时间", "术者", "助手", "切口", "体位",
+    "出血", "输液", "备注", "科室",
+)
+
+
+def _procedure_name(fact: ClinicalFact) -> str | None:
+    label = (fact.concept.display or "").strip()
+    text = fact.value.text if fact.value and fact.value.type == "text" else None
+
+    if label and any(bad in label for bad in _NON_PROCEDURE_LABELS):
+        return None
+    if text and (not label or any(good in label for good in _PROCEDURE_NAME_LABELS)):
+        return text.strip()
+    return (text or label).strip() or None
+
+
+def _med_attr(fact: ClinicalFact, field_name: str) -> str | None:
+    for key in _MED_ATTR_KEYS[field_name]:
+        value = fact.attributes.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _latest_attr(entries: list[tuple[date, ClinicalFact]], field_name: str) -> str | None:
+    """从后往前找第一条带这个属性的记录。
+
+    停药那条往往只有 status，没有剂量频次，只取最新一条会把字段全丢。
+    """
+    for _, fact in reversed(entries):
+        value = _med_attr(fact, field_name)
+        if value:
+            return value
+    return None
 
 
 def _parse_date(value) -> date | None:
@@ -178,7 +262,7 @@ def aggregate_context(
         entries.sort(key=lambda x: x[0])
         latest = entries[-1][1]
         status = latest.attributes.get("status", "active")
-        dose = latest.attributes.get("dose") or latest.attributes.get("dosage")
+        dose = _latest_attr(entries, "dose")
         stopped = None
         if status == "stopped" or status == "discontinued":
             stopped = entries[-1][0].isoformat()
@@ -188,6 +272,9 @@ def aggregate_context(
             since=entries[0][0].isoformat() if entries[0][0] != date.min else None,
             stopped=stopped,
             fact_id=latest.fact_id,
+            frequency=_latest_attr(entries, "frequency"),
+            route=_latest_attr(entries, "route"),
+            quantity=_latest_attr(entries, "quantity"),
         ))
 
     # recent_events 简单去重
@@ -202,6 +289,7 @@ def aggregate_context(
             continue
         seen_events.add(key)
         recent_events.append({
+            "event_id": event.event_id,
             "date": event_date.isoformat() if event_date else None,
             "type": event.event_type,
             "title": event.title,
@@ -233,9 +321,60 @@ def aggregate_context(
                 "fact_id": fact.fact_id,
             })
 
+    # 手术记录：procedure 类事实，加上出院小结里描述术式的句子。
+    # 后者没有 fact_id，只能引用到事件，但比整台手术漏掉好。
+    procedures: list[ProcedureRecord] = []
+    seen_procedures: set[tuple[str, str]] = set()
+    for event in events:
+        event_date = _parse_date(event.event_time.start)
+
+        for fact in event.facts:
+            if fact.kind != "procedure":
+                continue
+            fact_date = _parse_date(fact.time.start) or event_date
+            if not _time_in_window(fact_date, time_start, time_end):
+                continue
+            name = _procedure_name(fact)
+            if not name:
+                continue
+            key = (name[:20], fact_date.isoformat() if fact_date else "")
+            if key in seen_procedures:
+                continue
+            seen_procedures.add(key)
+            procedures.append(ProcedureRecord(
+                name=name,
+                date=fact_date.isoformat() if fact_date else None,
+                institution=event.institution,
+                source="fact",
+                fact_id=fact.fact_id,
+                event_id=event.event_id,
+            ))
+
+        text = (event.narrative or "").strip()
+        if not text or not _time_in_window(event_date, time_start, time_end):
+            continue
+        for sentence in _SENTENCE_SPLIT.split(text):
+            sentence = sentence.strip()
+            if len(sentence) < 4 or not _PROCEDURE_RE.search(sentence):
+                continue
+            key = (sentence[:20], event_date.isoformat() if event_date else "")
+            if key in seen_procedures:
+                continue
+            seen_procedures.add(key)
+            clauses = _procedure_clause(sentence)
+            procedures.append(ProcedureRecord(
+                name=clauses[:120],
+                date=event_date.isoformat() if event_date else None,
+                institution=event.institution,
+                source="narrative",
+                event_id=event.event_id,
+                quote=sentence[:120],
+            ))
+
     return AggregatedContext(
         series=series_list,
         active_medications=active_meds,
         recent_events=recent_events,
         clinical_notes=clinical_notes,
+        procedures=procedures,
     )
