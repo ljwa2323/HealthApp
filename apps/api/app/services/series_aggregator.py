@@ -34,6 +34,7 @@ class MedicationState:
     dose: str | None
     since: str | None
     stopped: str | None
+    fact_id: str | None = None
 
 
 @dataclass
@@ -41,6 +42,10 @@ class AggregatedContext:
     series: list[Series] = field(default_factory=list)
     active_medications: list[MedicationState] = field(default_factory=list)
     recent_events: list[dict] = field(default_factory=list)
+    clinical_notes: list[dict] = field(default_factory=list)
+
+
+CLINICAL_NOTE_KINDS = {"condition", "procedure", "symptom", "note"}
 
 
 def _parse_date(value) -> date | None:
@@ -182,6 +187,7 @@ def aggregate_context(
             dose=dose,
             since=entries[0][0].isoformat() if entries[0][0] != date.min else None,
             stopped=stopped,
+            fact_id=latest.fact_id,
         ))
 
     # recent_events 简单去重
@@ -202,8 +208,34 @@ def aggregate_context(
             "institution": event.institution,
         })
 
+    # 非检验类事实（诊断/手术/症状/叙述）结构化进 context，
+    # 让 LLM 回答手术史、诊断等问题时有数据可引用
+    clinical_notes: list[dict] = []
+    for event in events:
+        event_date = _parse_date(event.event_time.start)
+        for fact in event.facts:
+            if fact.kind not in CLINICAL_NOTE_KINDS:
+                continue
+            fact_date = _parse_date(fact.time.start) or event_date
+            if not _time_in_window(fact_date, time_start, time_end):
+                continue
+            text = None
+            if fact.value:
+                if fact.value.type == "text":
+                    text = fact.value.text
+                elif fact.value.number is not None:
+                    text = str(fact.value.number)
+            clinical_notes.append({
+                "kind": fact.kind,
+                "concept": fact.concept.display or "unknown",
+                "text": text,
+                "date": fact_date.isoformat() if fact_date else None,
+                "fact_id": fact.fact_id,
+            })
+
     return AggregatedContext(
         series=series_list,
         active_medications=active_meds,
         recent_events=recent_events,
+        clinical_notes=clinical_notes,
     )

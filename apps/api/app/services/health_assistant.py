@@ -17,6 +17,7 @@ SYSTEM_PROMPT = (
     "你只能使用提供给你的结构化 JSON 上下文回答问题。"
     "禁止编造上下文中没有的检验数值、诊断或用药。"
     "每个具体数值后面必须标注对应的 [fact_id]，例如'肌酐 96 μmol/L [f_xxx]'。"
+    "涉及诊断、手术史、症状、影像报告等问题时，参考 clinical_notes 与 recent_events 字段。"
     "如果上下文里没有相关数据，直接说明，不要猜测。"
     "回答用简体中文，分小节写，简洁清楚。"
     "\n"
@@ -33,6 +34,16 @@ SYSTEM_PROMPT = (
 )
 
 _FACT_ID_RE = re.compile(r"\[([a-zA-Z0-9_]+)\]")
+
+# A number written right before a [fact_id] tag, e.g. "ALT 55 U/L [f_alt]".
+# The gap may hold a unit, so it allows up to 12 chars but no newline, sentence
+# punctuation or brackets: that keeps "ALT 55 U/L，AST 30 U/L [f_alt]" from
+# pairing 55 with the other analyte's tag, and keeps a reference range written
+# in brackets from being read as the measured value.
+_NUM_PAIR_RE = re.compile(r"(-?\d+(?:\.\d+)?)([^\n\[\]，,。；;、（）()]{0,12})\[([a-zA-Z0-9_]+)\]")
+
+# Words that mark the neighbouring number as a threshold rather than a result.
+_RANGE_HINTS = ("参考", "正常", "范围", "上限", "下限", "高于", "低于", "超过")
 
 
 def _client() -> AsyncOpenAI:
@@ -74,10 +85,11 @@ def _build_context_payload(events, route_result, agg, gap_report) -> dict[str, A
         },
         "series": series_json,
         "active_medications": [
-            {"drug": m.drug, "dose": m.dose, "since": m.since, "stopped": m.stopped}
+            {"drug": m.drug, "dose": m.dose, "since": m.since, "stopped": m.stopped, "fact_id": m.fact_id}
             for m in agg.active_medications
         ],
         "recent_events": agg.recent_events,
+        "clinical_notes": agg.clinical_notes,
         "data_gaps": gap_report.gaps,
         "data_quality_issues": detect_data_quality_issues(events) if events else [],
         "panel_known": gap_report.panel_known,
@@ -85,12 +97,19 @@ def _build_context_payload(events, route_result, agg, gap_report) -> dict[str, A
     }
 
 
-def _collect_used_fact_ids(agg) -> list[str]:
-    ids: list[str] = []
+def _collect_fact_values(agg) -> dict[str, float | None]:
+    """fact_id -> recorded numeric value, for every fact the LLM may cite."""
+    values: dict[str, float | None] = {}
     for s in agg.series:
         for p in s.points:
-            ids.append(p.fact_id)
-    return ids
+            values[p.fact_id] = p.v
+    for m in agg.active_medications:
+        if m.fact_id:
+            values.setdefault(m.fact_id, None)
+    for n in agg.clinical_notes:
+        if n.get("fact_id"):
+            values.setdefault(n["fact_id"], None)
+    return values
 
 
 def detect_data_quality_issues(events: list) -> list[str]:
@@ -143,16 +162,64 @@ def detect_data_quality_issues(events: list) -> list[str]:
     return issues
 
 
-def validate_citations(answer: str, allowed_fact_ids: list[str]) -> dict[str, Any]:
-    """检查答案里 [xxx] 引用的 fact_id 是否都在本次 context 里。"""
+def _values_close(answer_value: float, record_value: float) -> bool:
+    """Allow rounding noise, reject a rewritten number."""
+    return abs(answer_value - record_value) <= max(0.05, abs(record_value) * 0.02)
+
+
+def validate_citations(
+    answer: str,
+    allowed_fact_ids: list[str],
+    fact_values: dict[str, float | None] | None = None,
+) -> dict[str, Any]:
+    """检查答案里的 [fact_id] 引用是否有效，并核对引用旁边的数值。
+
+    - 引用了不存在的 fact_id -> hallucinated_citations
+    - 引用了存在的 fact_id 但把数值写错 -> mismatched_values
+      只靠 id 校验发现不了后者：模型挂一个真实 id、配一个错数字，仍然"合法"。
+    """
     allowed = set(allowed_fact_ids)
     cited = set(_FACT_ID_RE.findall(answer))
     hallucinated = sorted(cited - allowed)
+
+    mismatched: list[dict[str, Any]] = []
+    if fact_values:
+        seen: set[tuple[str, str]] = set()
+        for match in _NUM_PAIR_RE.finditer(answer):
+            num_text, gap, fact_id = match.group(1), match.group(2), match.group(3)
+            if fact_id not in allowed:
+                continue
+            # "0-40 [f_alt]" or "比上限 40 高 [f_alt]" is a reference bound,
+            # not the value the model claims to have read.
+            if any(hint in gap for hint in _RANGE_HINTS):
+                continue
+            prefix = answer[max(0, match.start() - 12):match.start()]
+            if any(hint in prefix for hint in _RANGE_HINTS):
+                continue
+            record = fact_values.get(fact_id)
+            if record is None:
+                continue
+            try:
+                answer_value = float(num_text)
+            except ValueError:
+                continue
+            if (fact_id, num_text) in seen:
+                continue
+            seen.add((fact_id, num_text))
+            if not _values_close(answer_value, record):
+                mismatched.append({
+                    "fact_id": fact_id,
+                    "answer_value": answer_value,
+                    "record_value": record,
+                })
+
     return {
         "cited_fact_ids": sorted(cited),
         "allowed_fact_ids": sorted(allowed),
         "hallucinated_citations": hallucinated,
         "hallucination_count": len(hallucinated),
+        "mismatched_values": mismatched,
+        "mismatch_count": len(mismatched),
     }
 
 
@@ -204,9 +271,17 @@ def confidence_footer(confidence: float) -> str:
         return f"\n\n---\n置信度 {confidence:.2f}：数据严重不足，无法做出判断。建议携带已有资料到医院面诊。"
 
 
-async def _prepare(question: str, events: list) -> tuple[dict, list[dict[str, str]], list[str]]:
-    """路由 + 聚合 + 缺口 + 拼 messages。返回 (context_payload, messages, used_fact_ids)。"""
-    route = await route_question(question)
+async def _prepare(
+    question: str,
+    events: list,
+    route=None,
+) -> tuple[dict, list[dict[str, str]], list[str], dict[str, float | None]]:
+    """路由 + 聚合 + 缺口 + 拼 messages。
+
+    返回 (context_payload, messages, used_fact_ids, fact_values)。
+    """
+    if route is None:
+        route = await route_question(question)
     agg = aggregate_context(
         events=events,
         topic=route.topic,
@@ -217,7 +292,8 @@ async def _prepare(question: str, events: list) -> tuple[dict, list[dict[str, st
     gap_report = extract_data_gaps(events=events, topic=route.topic)
     context_payload = _build_context_payload(events, route, agg, gap_report)
     context_json = json.dumps(context_payload, ensure_ascii=False, indent=2)
-    used = _collect_used_fact_ids(agg)
+    fact_values = _collect_fact_values(agg)
+    used = list(fact_values)
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -230,7 +306,7 @@ async def _prepare(question: str, events: list) -> tuple[dict, list[dict[str, st
             ),
         },
     ]
-    return context_payload, messages, used
+    return context_payload, messages, used, fact_values
 
 
 async def answer_question(
@@ -238,8 +314,9 @@ async def answer_question(
     question: str,
     events: list,
     history: list[dict[str, str]] | None = None,
+    route=None,
 ) -> dict[str, Any]:
-    context_payload, messages, used = await _prepare(question, events)
+    context_payload, messages, used, fact_values = await _prepare(question, events, route)
 
     for turn in (history or [])[-6:]:
         role = turn.get("role")
@@ -251,12 +328,12 @@ async def answer_question(
     completion = await client.chat.completions.create(
         model="deepseek-chat",
         messages=messages,
-        temperature=0.2,
+        temperature=0.0,
         max_tokens=2048,
         stream=False,
     )
     answer = (completion.choices[0].message.content or "").strip()
-    citations = validate_citations(answer, used)
+    citations = validate_citations(answer, used, fact_values)
     confidence = compute_confidence(context_payload, citations)
     answer = answer + confidence_footer(confidence)
 
@@ -274,9 +351,10 @@ async def answer_question_stream(
     question: str,
     events: list,
     history: list[dict[str, str]] | None = None,
+    route=None,
 ) -> AsyncIterator[dict[str, Any]]:
     """流式版本：先 yield 路由/上下文元数据，再逐块 yield 答案文本，最后 yield 校验结果。"""
-    context_payload, messages, used = await _prepare(question, events)
+    context_payload, messages, used, fact_values = await _prepare(question, events, route)
 
     for turn in (history or [])[-6:]:
         role = turn.get("role")
@@ -295,7 +373,7 @@ async def answer_question_stream(
     stream = await client.chat.completions.create(
         model="deepseek-chat",
         messages=messages,
-        temperature=0.2,
+        temperature=0.0,
         max_tokens=2048,
         stream=True,
     )
@@ -310,7 +388,7 @@ async def answer_question_stream(
             yield {"type": "chunk", "text": delta}
 
     full_answer = "".join(answer_parts).strip()
-    citations = validate_citations(full_answer, used)
+    citations = validate_citations(full_answer, used, fact_values)
     confidence = compute_confidence(context_payload, citations)
     footer = confidence_footer(confidence)
     full_answer = full_answer + footer

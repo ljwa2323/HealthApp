@@ -7,6 +7,7 @@ import {
   askHealthAssistantStream,
   AssistantReply,
   changePassword,
+  CitationCheck,
   clearSession,
   ConversationSummary,
   deleteConversation,
@@ -45,7 +46,11 @@ type UploadState = {
   qualityWarning: boolean;
 };
 
-type ChatTurn = { role: "user" | "assistant"; content: string };
+type ChatTurn = {
+  role: "user" | "assistant";
+  content: string;
+  citationCheck?: CitationCheck | null;
+};
 
 type AssistantState = {
   messages: ChatTurn[];
@@ -2586,6 +2591,27 @@ function UploadPage({
   );
 }
 
+function CitationNotice({ check }: { check?: CitationCheck | null }) {
+  const mismatches = check?.mismatched_values ?? [];
+  const hallucinated = check?.hallucinated_citations ?? [];
+  if (mismatches.length === 0 && hallucinated.length === 0) return null;
+  return (
+    <div className="citation-warning">
+      <strong>这段回答的引用与记录不一致，请对照原报告核对</strong>
+      <ul>
+        {mismatches.map((item) => (
+          <li key={`${item.fact_id}-${item.answer_value}`}>
+            回答写的是 {item.answer_value}，记录里的值是 {item.record_value}
+          </li>
+        ))}
+        {hallucinated.length > 0 && (
+          <li>回答引用了不存在的记录：{hallucinated.join("、")}</li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
 function AssistantPage({
   session,
   events,
@@ -2716,12 +2742,12 @@ function AssistantPage({
       setAssistantState((prev) => {
         const msgs = [...prev.messages];
         const last = msgs.length - 1;
-        if (
-          last >= 0 &&
-          msgs[last].role === "assistant" &&
-          msgs[last].content === ""
-        ) {
-          msgs[last] = { role: "assistant", content: result.answer };
+        if (last >= 0 && msgs[last].role === "assistant") {
+          msgs[last] = {
+            role: "assistant",
+            content: result.answer,
+            citationCheck: result.citation_check,
+          };
         }
         return {
           ...prev,
@@ -2848,9 +2874,12 @@ function AssistantPage({
                 >
                   <strong>{turn.role === "user" ? "你" : "HealthApp AI"}</strong>
                   {turn.role === "assistant" ? (
-                    <div className="chat-content markdown-body">
-                      <Markdown>{turn.content}</Markdown>
-                    </div>
+                    <>
+                      <div className="chat-content markdown-body">
+                        <Markdown>{turn.content}</Markdown>
+                      </div>
+                      <CitationNotice check={turn.citationCheck} />
+                    </>
                   ) : (
                     <div className="chat-content">{turn.content}</div>
                   )}

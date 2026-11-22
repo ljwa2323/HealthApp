@@ -16,6 +16,25 @@ VALID_TOPICS = {
     "lipid",
     "blood_pressure",
     "blood_routine",
+    "thyroid_function",
+    "coagulation",
+    "tumor_markers",
+    "cardiac_enzymes",
+    "electrolytes",
+    "uric_acid",
+    "inflammation",
+    "urine_routine",
+    "iron_metabolism",
+    "bone_metabolism",
+    "hepatitis_b",
+    "sex_hormones",
+    "autoimmune",
+    "blood_gas",
+    "trace_elements",
+    "imaging_review",
+    "surgery_history",
+    "diagnosis",
+    "symptom_review",
     "general",
 }
 
@@ -43,8 +62,15 @@ ROUTER_SYSTEM = (
     "你是 HealthApp 的问题路由器。把用户的健康问题解析成结构化 JSON。\n"
     "只输出 JSON，不要解释。\n\n"
     "字段说明：\n"
-    "- topic: 临床主题，只能是 renal_function / glucose_metabolism / liver_function / "
-    "lipid / blood_pressure / blood_routine / general 之一。判断不出就用 general。\n"
+    "- topic: 临床主题，只能是 renal_function(肾功) / glucose_metabolism(血糖) / "
+    "liver_function(肝功) / lipid(血脂) / blood_pressure(血压) / blood_routine(血常规) / "
+    "thyroid_function(甲状腺) / coagulation(凝血功能) / tumor_markers(肿瘤标志物) / "
+    "cardiac_enzymes(心肌酶) / electrolytes(电解质) / uric_acid(尿酸) / "
+    "inflammation(炎症指标) / urine_routine(尿常规) / iron_metabolism(铁代谢) / "
+    "bone_metabolism(骨代谢) / hepatitis_b(乙肝五项) / sex_hormones(性激素) / "
+    "autoimmune(风湿免疫) / blood_gas(血气分析) / trace_elements(微量元素) / "
+    "imaging_review(影像报告解读) / surgery_history(手术史) / diagnosis(诊断与慢病) / "
+    "symptom_review(症状自述) / general(其他) 之一。判断不出就用 general。\n"
     "- question_type: 问题类型，只能是 trend_query（趋势变化）/ latest_value（最新值）/ "
     "medication_review（用药情况）/ summary（整体总结）/ specific_event（某次具体事件）/ "
     "unknown 之一。\n"

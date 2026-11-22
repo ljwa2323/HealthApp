@@ -466,6 +466,7 @@ async def assistant_analyze(
         evidence_refs=[],
         used_fact_ids=result.get("used_fact_ids") or [],
         context=result.get("context"),
+        citation_check=result.get("citation_check"),
     )
 
 
@@ -593,6 +594,7 @@ async def assistant_chat(
         used_fact_ids=result.get("used_fact_ids") or [],
         context=result.get("context"),
         conversation_id=conv_id,
+        citation_check=result.get("citation_check"),
     )
 
 

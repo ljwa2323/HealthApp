@@ -257,3 +257,5 @@ class AssistantReply(BaseModel):
     used_fact_ids: list[str] = Field(default_factory=list)
     context: dict[str, Any] | None = None
     conversation_id: str | None = None
+    # fact_id 存在性 + 引用旁数值的双重校验结果
+    citation_check: dict[str, Any] | None = None

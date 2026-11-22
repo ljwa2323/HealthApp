@@ -404,6 +404,22 @@ export type AssistantReply = {
     evidence_refs?: string[];
   } | null;
   conversation_id?: string | null;
+  citation_check?: CitationCheck | null;
+};
+
+export type CitationMismatch = {
+  fact_id: string;
+  answer_value: number;
+  record_value: number;
+};
+
+export type CitationCheck = {
+  cited_fact_ids?: string[];
+  allowed_fact_ids?: string[];
+  hallucinated_citations?: string[];
+  hallucination_count?: number;
+  mismatched_values?: CitationMismatch[];
+  mismatch_count?: number;
 };
 
 export type ConversationSummary = {
@@ -512,6 +528,7 @@ export type StreamEvent = {
   context?: AssistantReply["context"] | null;
   used_fact_ids?: string[];
   detail?: string;
+  citation_check?: CitationCheck | null;
 };
 
 export type StreamResult = {
@@ -520,6 +537,7 @@ export type StreamResult = {
   context: AssistantReply["context"] | null;
   used_fact_ids: string[];
   confidence: number | null;
+  citation_check: CitationCheck | null;
 };
 
 export async function askHealthAssistantStream(
@@ -556,6 +574,7 @@ export async function askHealthAssistantStream(
   let context: AssistantReply["context"] | null = null;
   let usedFactIds: string[] = [];
   let confidence: number | null = null;
+  let citationCheck: CitationCheck | null = null;
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -584,6 +603,7 @@ export async function askHealthAssistantStream(
       } else if (event.type === "done") {
         answer = event.answer ?? answer;
         confidence = event.confidence ?? null;
+        citationCheck = event.citation_check ?? null;
         conversationIdResult = event.conversation_id ?? conversationIdResult;
       } else if (event.type === "error") {
         throw new Error(event.detail ?? "流式回答失败");
@@ -597,5 +617,6 @@ export async function askHealthAssistantStream(
     context,
     used_fact_ids: usedFactIds,
     confidence,
+    citation_check: citationCheck,
   };
 }

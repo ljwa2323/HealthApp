@@ -2151,6 +2151,29 @@ main {
   cursor: pointer;
 }
 
+/* Answer cited a fact but wrote a different number than the record holds. */
+.citation-warning {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(217, 119, 6, 0.14);
+  border: 1px solid rgba(217, 119, 6, 0.4);
+}
+
+.citation-warning strong {
+  display: block;
+  color: #ffd7a8;
+  font-size: 12px;
+}
+
+.citation-warning ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: #f3ddc0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .assistant-chat {
   display: flex;
   flex-direction: column;

@@ -5,7 +5,7 @@ import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -36,6 +36,7 @@ class ArtifactRecord:
     media_type: str | None
     storage_path: str
     created_at: str
+    sha256: str | None = None
 
 
 class AuthStore:
@@ -99,6 +100,7 @@ class AuthStore:
                     file_name TEXT NOT NULL,
                     media_type TEXT,
                     storage_path TEXT NOT NULL,
+                    sha256 TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -122,6 +124,11 @@ class AuthStore:
                 ON conversations(patient_id);
                 """
             )
+            # Migration for databases created before the sha256 dedup column.
+            try:
+                conn.execute("ALTER TABLE artifacts ADD COLUMN sha256 TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     @staticmethod
     def _hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
@@ -277,17 +284,34 @@ class AuthStore:
             sex=user.sex,
         )
 
-    def list_events(self, patient_id: str) -> list[ClinicalEvent]:
+    def list_events(
+        self,
+        patient_id: str,
+        time_start: date | None = None,
+        time_end: date | None = None,
+    ) -> list[ClinicalEvent]:
+        """
+        按患者读时间轴事件。
+        time_start / time_end 下推到 SQL（event_time 是 ISO 文本）：
+        - 有 time_start 时只返回 event_time >= time_start 的事件
+        - 有 time_end 时只返回 event_time < time_end + 1 天的事件（闭区间当天全含）
+        - 两个都为空时保持原全量行为
+        """
+        sql = """
+            SELECT payload_json
+            FROM events
+            WHERE patient_id = ?
+        """
+        params: list = [patient_id]
+        if time_start is not None:
+            sql += " AND event_time >= ?"
+            params.append(time_start.isoformat())
+        if time_end is not None:
+            sql += " AND event_time < ?"
+            params.append((time_end + timedelta(days=1)).isoformat())
+        sql += " ORDER BY COALESCE(event_time, '') DESC, created_at DESC"
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT payload_json
-                FROM events
-                WHERE patient_id = ?
-                ORDER BY COALESCE(event_time, '') DESC, created_at DESC
-                """,
-                (patient_id,),
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [ClinicalEvent.model_validate(json.loads(row["payload_json"])) for row in rows]
 
     def add_event(self, event: ClinicalEvent) -> ClinicalEvent:
@@ -342,6 +366,7 @@ class AuthStore:
         file_name: str,
         media_type: str | None,
         content: bytes,
+        sha256: str | None = None,
     ) -> ArtifactRecord:
         safe_name = Path(file_name).name or "upload.bin"
         target_dir = self.uploads_root() / patient_id / artifact_id
@@ -355,17 +380,19 @@ class AuthStore:
             media_type=media_type,
             storage_path=str(target_path),
             created_at=datetime.now(timezone.utc).isoformat(),
+            sha256=sha256,
         )
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO artifacts (
-                    artifact_id, patient_id, file_name, media_type, storage_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    artifact_id, patient_id, file_name, media_type, storage_path, sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(artifact_id) DO UPDATE SET
                     file_name = excluded.file_name,
                     media_type = excluded.media_type,
-                    storage_path = excluded.storage_path
+                    storage_path = excluded.storage_path,
+                    sha256 = excluded.sha256
                 """,
                 (
                     record.artifact_id,
@@ -373,6 +400,7 @@ class AuthStore:
                     record.file_name,
                     record.media_type,
                     record.storage_path,
+                    record.sha256,
                     record.created_at,
                 ),
             )
@@ -429,7 +457,7 @@ class AuthStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT artifact_id, patient_id, file_name, media_type, storage_path, created_at
+                SELECT artifact_id, patient_id, file_name, media_type, storage_path, sha256, created_at
                 FROM artifacts
                 WHERE patient_id = ? AND artifact_id = ?
                 """,
@@ -444,6 +472,34 @@ class AuthStore:
             media_type=row["media_type"],
             storage_path=row["storage_path"],
             created_at=row["created_at"],
+            sha256=row["sha256"],
+        )
+
+    def find_artifact_by_sha256(
+        self, patient_id: str, sha256: str
+    ) -> ArtifactRecord | None:
+        """Return the newest artifact with the same file hash (dedup)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT artifact_id, patient_id, file_name, media_type, storage_path, sha256, created_at
+                FROM artifacts
+                WHERE patient_id = ? AND sha256 = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (patient_id, sha256),
+            ).fetchone()
+        if row is None:
+            return None
+        return ArtifactRecord(
+            artifact_id=row["artifact_id"],
+            patient_id=row["patient_id"],
+            file_name=row["file_name"],
+            media_type=row["media_type"],
+            storage_path=row["storage_path"],
+            created_at=row["created_at"],
+            sha256=row["sha256"],
         )
 
     # ---- conversations ----

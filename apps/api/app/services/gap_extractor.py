@@ -69,6 +69,163 @@ TOPIC_PANELS: dict[str, dict] = {
         ],
         "max_age_days": 365,
     },
+    "thyroid_function": {
+        "required": [
+            ["促甲状腺激素", "TSH"],
+            ["游离三碘甲状腺原氨酸", "FT3"],
+            ["游离甲状腺素", "FT4"],
+            ["抗甲状腺过氧化物酶抗体", "TPOAb", "甲状腺过氧化物酶抗体"],
+            ["抗甲状腺球蛋白抗体", "TGAb", "甲状腺球蛋白抗体"],
+        ],
+        "max_age_days": 365,
+    },
+    "coagulation": {
+        "required": [
+            ["凝血酶原时间", "PT"],
+            ["活化部分凝血活酶时间", "APTT"],
+            ["INR", "国际标准化比值"],
+            ["纤维蛋白原", "FIB"],
+        ],
+        "max_age_days": 365,
+    },
+    "tumor_markers": {
+        "required": [
+            ["甲胎蛋白", "AFP"],
+            ["癌胚抗原", "CEA"],
+            ["糖类抗原19-9", "CA19-9", "CA199"],
+            ["糖类抗原125", "CA125"],
+            ["糖类抗原15-3", "CA15-3", "CA153"],
+            ["前列腺特异性抗原", "PSA"],
+        ],
+        "max_age_days": 365,
+    },
+    "cardiac_enzymes": {
+        "required": [
+            ["肌酸激酶", "CK"],
+            ["肌酸激酶同工酶", "CK-MB"],
+            ["乳酸脱氢酶", "LDH"],
+            ["肌钙蛋白", "cTnI", "高敏肌钙蛋白", "hs-cTnI"],
+            ["脑钠肽", "BNP", "NT-proBNP", "N端前脑钠肽"],
+        ],
+        "max_age_days": 180,
+    },
+    "electrolytes": {
+        "required": [
+            ["钾", "K+", "钾离子"],
+            ["钠", "Na+", "钠离子"],
+            ["氯", "Cl-", "氯离子"],
+            ["钙", "Ca", "血钙"],
+            ["镁", "Mg"],
+            ["磷", "无机磷", "Phosphorus"],
+        ],
+        "max_age_days": 90,
+    },
+    "uric_acid": {
+        "required": [
+            ["尿酸", "UA", "血尿酸"],
+        ],
+        "max_age_days": 365,
+    },
+    "inflammation": {
+        "required": [
+            ["C反应蛋白", "CRP", "超敏C反应蛋白"],
+            ["血沉", "ESR"],
+            ["降钙素原", "PCT"],
+            ["白细胞介素-6", "IL-6"],
+        ],
+        "max_age_days": 90,
+    },
+    "urine_routine": {
+        "required": [
+            ["尿蛋白", "PRO"],
+            ["尿糖", "尿葡萄糖"],
+            ["尿酮体", "KET"],
+            ["尿白细胞"],
+            ["尿潜血", "尿红细胞", "BLD"],
+        ],
+        "max_age_days": 365,
+    },
+    "iron_metabolism": {
+        "required": [
+            ["血清铁", "Fe", "血铁"],
+            ["铁蛋白", "Ferritin"],
+            ["总铁结合力", "TIBC"],
+            ["转铁蛋白", "Transferrin"],
+        ],
+        "max_age_days": 365,
+    },
+    "bone_metabolism": {
+        "required": [
+            ["25-羟基维生素D", "25-OH-VD", "维生素D"],
+            ["甲状旁腺激素", "PTH"],
+        ],
+        "max_age_days": 365,
+    },
+    "hepatitis_b": {
+        "required": [
+            ["乙肝表面抗原", "HBsAg"],
+            ["乙肝表面抗体", "HBsAb"],
+            ["乙肝e抗原", "HBeAg"],
+            ["乙肝e抗体", "HBeAb"],
+            ["乙肝核心抗体", "HBcAb"],
+        ],
+        "max_age_days": 365,
+    },
+    "sex_hormones": {
+        "required": [
+            ["促卵泡激素", "FSH"],
+            ["促黄体生成素", "LH"],
+            ["雌二醇", "E2"],
+            ["孕酮", "Progesterone"],
+            ["睾酮", "Testosterone"],
+            ["催乳素", "PRL"],
+        ],
+        "max_age_days": 180,
+    },
+    "autoimmune": {
+        "required": [
+            ["类风湿因子", "RF"],
+            ["抗环瓜氨酸肽抗体", "抗CCP"],
+            ["抗核抗体", "ANA"],
+        ],
+        "max_age_days": 365,
+    },
+    "blood_gas": {
+        "required": [
+            ["pH"],
+            ["二氧化碳分压", "PaCO2"],
+            ["氧分压", "PaO2"],
+            ["碳酸氢根", "HCO3-"],
+            ["乳酸", "Lac"],
+        ],
+        "max_age_days": 90,
+    },
+    "trace_elements": {
+        "required": [
+            ["锌", "Zn"],
+            ["铜", "Cu"],
+            ["硒", "Se"],
+        ],
+        "max_age_days": 365,
+    },
+    # 非检验面板：按事件类型 / fact.kind 判断档案里有没有这类记录。
+    # 没有 required 指标清单，只有"有没有"的缺口检查。
+    "imaging_review": {
+        "match_event_types": ["imaging"],
+        "gap_text": "档案中没有影像报告（CT / MRI / X光等）",
+    },
+    "surgery_history": {
+        "match_kinds": ["procedure"],
+        "gap_text": "档案中没有手术或操作记录",
+    },
+    "diagnosis": {
+        "match_kinds": ["condition"],
+        "gap_text": "档案中没有诊断记录（如慢病、出院诊断）",
+    },
+    "symptom_review": {
+        "match_kinds": ["symptom"],
+        "gap_text": "档案中没有症状自述记录",
+    },
 }
 
 
@@ -93,7 +250,11 @@ def _matches_concept(fact: ClinicalFact, concept: str) -> bool:
         _normalize(fact.concept.display),
         _normalize(fact.concept.local_display),
     ]
-    return any(needle in h or h in needle for h in haystacks if h)
+    # Forward containment only: the fact's name must contain the panel alias.
+    # The reverse direction (alias contains fact name) let a one-character OCR
+    # fragment such as "白" satisfy 白蛋白, which then reported a made-up
+    # "already tested 20 months ago" entry for ALB/GLB/TP.
+    return any(needle in h for h in haystacks if h)
 
 
 def _parse_date(value) -> date | None:
@@ -134,9 +295,26 @@ def extract_data_gaps(
         return GapReport(panel_known=False, observed_concepts=observed)
 
     panel = TOPIC_PANELS[topic]
-    required = panel["required"]
-    max_age = panel["max_age_days"]
+    max_age = panel.get("max_age_days", 365)
     today = today or date.today()
+
+    # 非检验面板：按事件类型 / fact.kind 判断档案里有没有这类记录
+    match_event_types = panel.get("match_event_types") or []
+    match_kinds = panel.get("match_kinds") or []
+    if match_event_types or match_kinds:
+        present_types = {event.event_type for event in events}
+        present_kinds = {fact.kind for event in events for fact in event.facts}
+        has = True
+        if match_event_types:
+            has = has and all(t in present_types for t in match_event_types)
+        if match_kinds:
+            has = has and all(k in present_kinds for k in match_kinds)
+        gap_text = panel.get("gap_text") or "档案中缺少相关记录"
+        if not has:
+            return GapReport(gaps=[gap_text], panel_known=True, observed_concepts=observed)
+        return GapReport(gaps=[], panel_known=True, observed_concepts=observed)
+
+    required = panel["required"]
 
     gaps: list[str] = []
     for alias_group in required:
