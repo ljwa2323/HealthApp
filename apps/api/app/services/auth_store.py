@@ -293,8 +293,10 @@ class AuthStore:
         """
         按患者读时间轴事件。
         time_start / time_end 下推到 SQL（event_time 是 ISO 文本）：
-        - 有 time_start 时只返回 event_time >= time_start 的事件
-        - 有 time_end 时只返回 event_time < time_end + 1 天的事件（闭区间当天全含）
+        - 有 time_start 时返回 event_time >= time_start 的事件
+        - 有 time_end 时返回 event_time < time_end + 1 天的事件（闭区间当天全含）
+        - 没有 event_time 的事件一律保留：日期是空的，不能证明它落在窗口外，
+          丢掉会让"我吃过什么药"这类检索漏掉没读到日期的记录
         - 两个都为空时保持原全量行为
         """
         sql = """
@@ -304,10 +306,10 @@ class AuthStore:
         """
         params: list = [patient_id]
         if time_start is not None:
-            sql += " AND event_time >= ?"
+            sql += " AND (event_time IS NULL OR event_time >= ?)"
             params.append(time_start.isoformat())
         if time_end is not None:
-            sql += " AND event_time < ?"
+            sql += " AND (event_time IS NULL OR event_time < ?)"
             params.append((time_end + timedelta(days=1)).isoformat())
         sql += " ORDER BY COALESCE(event_time, '') DESC, created_at DESC"
         with self._connect() as conn:

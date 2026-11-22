@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 from typing import AsyncIterator, Any
 
 from openai import AsyncOpenAI
@@ -75,7 +76,14 @@ _DRUG_FORM_RE = re.compile(
     r"口服液|注射液|滴眼液|乳膏|软膏|糖浆|片|丸))"
 )
 _GENERIC_FORM_WORDS = {"药片", "片剂", "胶囊剂", "颗粒剂", "药物", "药品", "中成药", "西药", "口服药"}
+# 以"片"结尾但不是药的常用词，避免把"药盒照片"当成药名
+_NON_DRUG_FORM_WORDS = {
+    "照片", "图片", "卡片", "芯片", "名片", "胶片", "底片", "相片", "镜片",
+    "刀片", "纸片", "铁片", "大片", "贴片", "切片", "药盒照片",
+}
 _ADVICE_WORDS = ("建议", "可以", "考虑", "推荐", "如需", "必要时", "可尝试", "应服用", "也可")
+# 判定"这是在说某种药"的上下文，避免把照片、卡片这类词算成药名
+_DRUG_CONTEXT_WORDS = ("服用", "口服", "吃过", "用药", "剂量", "每日", "每次", "一片", "半片", "停药", "开药")
 
 
 def _client() -> AsyncOpenAI:
@@ -298,13 +306,28 @@ def _drugs_in_answer(answer: str) -> list[str]:
     found = []
     for match in _DRUG_FORM_RE.finditer(answer):
         name = match.group(1)
-        if name in _GENERIC_FORM_WORDS:
+        if name in _GENERIC_FORM_WORDS or name in _NON_DRUG_FORM_WORDS:
             continue
         near = answer[max(0, match.start() - 15): match.end() + 15]
         if any(word in near for word in _ADVICE_WORDS):
             continue  # 建议/推荐里提到的药不算"记录里没有"
+        if not any(word in near for word in _DRUG_CONTEXT_WORDS):
+            continue  # 没有用药语境，多半是照片、卡片一类的词
         found.append(name)
     return found
+
+
+def _mentions(name: str, answer: str) -> bool:
+    """答案里提没提到这条记录。名字常被写短（"肝泰乐片"写成"肝泰乐"、
+    "腹腔镜胆囊切除术"写成"胆囊切除"），按最长公共子串判断，不用全名匹配。"""
+    if not name:
+        return False
+    if name in answer:
+        return True
+    longest = SequenceMatcher(None, name, answer).find_longest_match(
+        0, len(name), 0, len(answer)
+    ).size
+    return longest >= max(3, len(name) // 2)
 
 
 def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
@@ -321,7 +344,7 @@ def check_lookup_consistency(answer: str, lookup: dict | None) -> dict | None:
     matched_ids = set(lookup_fact_ids(lookup))
     cited = set(_FACT_ID_RE.findall(answer))
     names = [item.get("name") or item.get("drug") or "" for item in matched]
-    named = any(name and name[:6] in answer for name in names)
+    named = any(_mentions(name, answer) for name in names)
 
     if lookup.get("kind") == "medication":
         allowed = {normalize_drug(n) for n in lookup_drug_names(lookup)}

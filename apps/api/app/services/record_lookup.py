@@ -308,7 +308,8 @@ def lookup_by_plan(plan: dict | None, agg: AggregatedContext, *, today: date | N
         if mode == "list" and not hint:
             return lookup_procedure_list(agg)
         return lookup_procedures(agg, "", keyword=hint or None)
-    if mode == "list" and not hint:
+    if not hint:
+        # 问"用过哪些药"却没给药名，只能列清单；按空线索匹配会把每种药都判成 0 分
         return lookup_medication_list(agg, scope=scope, today=today)
     return lookup_medications(agg, "", today, hint=hint)
 
