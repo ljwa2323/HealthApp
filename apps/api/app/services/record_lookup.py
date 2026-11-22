@@ -192,32 +192,31 @@ def _med_duration(med, today: date) -> dict:
 
     pieces: list[str] = []
     for index, info in enumerate(dated, start=1):
-        if info["days"] is None:
-            piece = f"{info['since']} 只有一次记录，没写用药起止"
-        elif info["until"]:
-            piece = f"{info['since']}～{info['until']}，用药期{_span_text(info['days'])}"
-            if info["dose_days"] is not None:
-                piece += f"，按“{med.frequency}”算约 {info['dose_days']} 天在服药"
+        if len(dated) > 1:
+            if info["days"] is None:
+                piece = f"第{index}段 {info['since']} 只有一次记录"
+            else:
+                end = info["until"] or info["last"]
+                piece = f"第{index}段 {info['since']}～{end}（{info['days']} 天）"
+        elif info["days"] is None:
+            piece = f"{info['since']} 只有一次记录，没有起止"
         else:
-            piece = (
-                f"{info['since']} 起有记录，按记录算到 {info['last']} 约{_span_text(info['days'])}"
-            )
+            end = info["until"] or info["last"]
+            piece = f"{info['since']}～{end}，用药期{_span_text(info['days'])}"
             if info["dose_days"] is not None:
-                piece += f"，按“{med.frequency}”算约 {info['dose_days']} 天在服药"
-        pieces.append(f"第{index}段：{piece}" if len(dated) > 1 else piece)
+                piece += f"，按{med.frequency}算约 {info['dose_days']} 天在服药"
+        pieces.append(piece)
 
     if len(dated) > 1:
-        text = "共 " + str(len(dated)) + " 段用药期。" + "；".join(pieces)
-        if total_days is not None:
-            text += f"。累计用药期{_span_text(total_days)}"
-        if span_days is not None:
-            text += f"，从第一次到最后一条记录跨{_span_text(span_days)}，中间的空档不算在吃药"
+        text = f"共 {len(dated)} 段：" + "；".join(pieces) + "。"
         if dose_days is not None:
-            text += f"，估计实际服药 {dose_days} 天"
+            text += f"估计服药 {dose_days} 天（{med.frequency}）"
+        elif total_days is not None:
+            text += f"累计用药期{_span_text(total_days)}"
     else:
         text = pieces[0]
     if ongoing:
-        text += "；最后一段没有停药记录，之后是否还在吃没法从档案确认"
+        text += "；最后一段没有停药记录"
 
     return {
         "days": total_days,

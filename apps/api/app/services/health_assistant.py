@@ -21,41 +21,32 @@ from .series_aggregator import aggregate_context
 
 
 SYSTEM_PROMPT = (
-    "你是 HealthApp 的纵向健康分析助手。回答分两层，写法要分开。\n"
-    "第一层，患者档案：检验数值、诊断、用药、手术、症状只能来自上下文 JSON。"
-    "每个具体数值后面标对应的 [fact_id]，例如'肌酐 96 μmol/L [f_xxx]'。"
-    "上下文里没有的记录不许补，也不许把常识说成档案里的结论。\n"
-    "第二层，通用医学常识：用来解释指标含义、说明一般处理原则、补充建议时可以写，"
-    "但必须单独成段，并写明'以下是通用医学常识，不针对你的具体病情'；"
-    "不写具体指南名称或版本号，不给精确的百分比数字（如'五年生存率 70%'），"
-    "只给定性判断，同时说明适用条件、与你档案情况的差异、还存在哪些不确定。\n"
-    "涉及诊断、手术史、症状、影像报告等问题时，参考 clinical_notes 与 recent_events 字段。"
-    "问'有没有做过某台手术''有没有吃过某种药'时，以 lookup_result 为准："
-    "matched 非空就只能引用 matched 里的条目，并标 [fact_id]；没有 fact_id 的叙述性记录标它的事件 id，"
-    "如 [evt_xxx]；"
-    "matched 为空必须明说档案里没有找到相关记录，不能用常识或推测补充；"
-    "只有 candidates 没有 matched 时，把候选药名列出来让用户确认是哪一种，不要自行选定一个当作答案。"
-    "问'我的用药情况怎么样''我用过哪些药'这类清单问题时，lookup_result 的 mode 是 list，"
-    "要把 matched 里的药全部列出（药名、剂量、频次、起止时间、是否还在用），不要只挑一两味；"
-    "清单里只能出现 lookup_result 或 active_medications 里的药名，档案里没有的药不能补进去。"
-    "问吃了多久时，按 duration_text 的说法讲，并且分开说两件事："
-    "用药期是从哪天到哪天、一共多久；实际服药天数是按频次换算的（比如两天吃一次，等于用药期的一半）。"
-    "有多段用药期就一段一段讲，不要把中间的空档算成一直在吃。"
-    "引用标签只能是记录 id（fact_id 或事件 id），不要把 lookup_result 这类字段名写成方括号标签，"
-    "正文里也不要直接念字段名（data_gaps、active_medications 之类），用'档案里缺什么'这样的说法。"
-    "如果上下文里没有相关数据，直接说明，不要猜测。"
-    "回答用简体中文，分小节写，简洁清楚。\n"
+    "你是 HealthApp 的健康档案助手。回答要短：默认 200 字以内，问用药清单最多 300 字。\n"
+    "第一句直接给结论，后面只留支撑结论的记录。不用 Markdown 标题，不分小节，不复述问题，"
+    "不解释自己怎么查的，不提字段名（lookup_result、data_gaps 之类）。"
+    "列表只在真有多条要列时用，不超过 5 条；一句话能说完就一句话。"
+    "只回答问到的事：问用药就只讲用药，不要顺带评价其他指标、不要补体检建议。\n"
     "\n"
-    "问'要不要做某手术''该不该用某药''这种情况怎么办'这类问题时，按这个顺序写："
-    "(1)先看档案里有没有相关的诊断、检查、既往手术或用药，说清现有记录支持什么、还缺什么；"
-    "(2)再给通用层面的考量，比如适应证、风险、替代方案，这一段标成通用医学常识；"
-    "(3)说明每个人情况不同、这些不能替代面诊，把不确定的地方讲出来。"
-    "不要只回一句'资料不足'，也不要把通用常识直接写成对这位患者下的结论。\n"
-    "看指标时，像医生读报告：先说看到什么异常或可疑，再说要确认判断还缺什么检查（参考 data_gaps），"
-    "同时指出已有数据本身的问题（参考 data_quality_issues，比如缺日期、缺单位、OCR 识别错误），"
-    "最后建议补充什么材料。数据已经足够时直接给判断，不要额外索要检查。\n"
+    "内容分两层：\n"
+    "档案层：检验数值、诊断、用药、手术、症状只能来自上下文，数值后标 [fact_id]，如'肌酐 96 μmol/L [f_xxx]'，"
+    "上下文里没有的不许补。\n"
+    "常识层：解释指标、说明一般处理原则可以用通用医学常识，但要用'一般来说'这类说法点明，"
+    "不写具体指南名称或版本，不给精确百分比（如'五年生存率 70%'），只给定性判断，"
+    "并说清与本人情况的差异和不确定的地方。两层不许混写。\n"
     "\n"
-    "这是患者自助参考，不是医疗诊断，最后提醒一句'具体诊疗请咨询执业医生'。"
+    "问'有没有做过某台手术''有没有吃过某种药'时以 lookup_result 为准："
+    "有 matched 就只引用 matched 里的条目并标 id，叙述性记录标事件 id（如 [evt_xxx]）；"
+    "matched 为空直说档案里没查到；只有 candidates 时把候选列出来让用户确认，不要替用户认定。"
+    "问'我的用药情况怎么样'这类清单时把 matched 里的药全部列出（药名、剂量频次、起止、是否还在用），"
+    "答案里的药名只能来自 lookup_result 或 active_medications。"
+    "讲时长按 duration_text：先说服药期多久，再说按频次折算的服药天数；"
+    "多段就分段说，中间空档不算在吃药。\n"
+    "\n"
+    "问'要不要做某手术''该不该用某药''怎么办'这类问题时，按三步写，每步一到两句："
+    "档案里支持什么、缺什么；通用层面的考量（用通用医学常识，标'一般来说'）；需要面诊才能定。"
+    "不要只回'资料不足'，也不要把常识写成对这个人下的结论。\n"
+    "看指标时先说看到什么异常，再说还缺什么检查，最后说建议补什么；数据够了就直接给判断。\n"
+    "引用标签只能是记录 id。回答用简体中文。"
 )
 
 _FACT_ID_RE = re.compile(r"\[([a-zA-Z0-9_]+)\]")
@@ -92,6 +83,9 @@ _NON_DRUG_FORM_WORDS = {
 _ADVICE_WORDS = ("建议", "可以", "考虑", "推荐", "如需", "必要时", "可尝试", "应服用", "也可")
 # 判定"这是在说某种药"的上下文，避免把照片、卡片这类词算成药名
 _DRUG_CONTEXT_WORDS = ("服用", "口服", "吃过", "用药", "剂量", "每日", "每次", "一片", "半片", "停药", "开药")
+# 剂量写法常以"片"结尾：每次1片、每日2片、一次半片
+_DOSAGE_PREFIXES = ("每次", "每日", "每天", "一天", "一次", "一日", "每回")
+_DOSAGE_ONLY_RE = re.compile(r"^(?:每次|每日|每天|一天|一次|一日|每回)?[0-9一二两三四半.]{1,4}$")
 
 
 def _client() -> AsyncOpenAI:
@@ -177,8 +171,10 @@ def _collect_fact_values(agg) -> dict[str, float | None]:
         for p in s.points:
             values[p.fact_id] = p.v
     for m in agg.active_medications:
-        if m.fact_id:
-            values.setdefault(m.fact_id, None)
+        # 同一味药有开头、停药多条记录，模型引哪一条都该算合法
+        for fact_id in (m.fact_ids or [m.fact_id]):
+            if fact_id:
+                values.setdefault(fact_id, None)
     for n in agg.clinical_notes:
         if n.get("fact_id"):
             values.setdefault(n["fact_id"], None)
@@ -320,6 +316,9 @@ def _drugs_in_answer(answer: str) -> list[str]:
         name = match.group(1)
         if name in _GENERIC_FORM_WORDS or name in _NON_DRUG_FORM_WORDS:
             continue
+        # "每次1片""每次半片"是剂量写法，不是药名；含字母数字的药名（维生素B12）仍要查
+        if _DOSAGE_ONLY_RE.match(name) or name.startswith(_DOSAGE_PREFIXES):
+            continue
         near = answer[max(0, match.start() - 15): match.end() + 15]
         if any(word in near for word in _ADVICE_WORDS):
             continue  # 建议/推荐里提到的药不算"记录里没有"
@@ -350,7 +349,7 @@ _DENY_WORDS = ("没有找到", "未找到", "没有相关记录", "没有这类�
 # 答案已经说明"只能当候选、需要确认"时，附带的列举不算肯定说法
 _HEDGE_RE = re.compile(r"没有完全对上|没有完全匹配|候选|需要.{0,4}确认|不确定|无法确认|待确认")
 # 肯定词前面有否定词，是"不能确认你做过"这种写法，不算下结论
-_NEGATION_RE = re.compile(r"不能|无法|没有|未见|并非|不确定|难以|存疑|是否")
+_NEGATION_RE = re.compile(r"不能|无法|没有|未见|并非|不确定|难以|存疑|是否|如果|假如|若|要是")
 
 
 def _sentence_around(text: str, index: int) -> str:
@@ -488,21 +487,19 @@ def compute_confidence(
 
 
 def confidence_footer(confidence: float) -> str:
-    """根据置信度生成结尾提示语。"""
+    """一句话收尾，不再复述上文已经写过的内容。"""
     if confidence >= 0.8:
-        return f"\n\n---\n置信度 {confidence:.2f}：本次答案基于较完整的已有记录，仅供参考，具体诊疗请咨询执业医生。"
-    elif confidence >= 0.5:
-        return f"\n\n---\n置信度 {confidence:.2f}：有部分数据支持上述判断，但仍有缺口。建议补充缺失的检查报告后再做更完整评估，必要时咨询医生。"
-    elif confidence >= 0.3:
-        return f"\n\n---\n置信度 {confidence:.2f}：现有数据不足以给出可靠判断。上文已列出你看到的异常和还缺的检查，建议补充上传相关报告或去医院做对应检查后再来问。"
-    else:
-        return f"\n\n---\n置信度 {confidence:.2f}：数据严重不足，无法做出判断。建议携带已有资料到医院面诊。"
+        return f"\n\n置信度 {confidence:.2f} · 仅供参考，具体请咨询医生"
+    if confidence >= 0.5:
+        return f"\n\n置信度 {confidence:.2f} · 资料不全，仅供参考"
+    return f"\n\n置信度 {confidence:.2f} · 资料不足，仅供参考"
 
 
 async def _prepare(
     question: str,
     events: list,
     route=None,
+    history: list[dict[str, str]] | None = None,
 ) -> tuple[dict, list[dict[str, str]], list[str], dict[str, float | None]]:
     """路由 + 聚合 + 缺口 + 拼 messages。
 
@@ -527,17 +524,21 @@ async def _prepare(
     fact_values = _collect_fact_values(agg)
     used = list(fact_values)
 
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "结构化患者上下文如下。档案事实以它为准；通用医学常识按系统说明单独成段写。\n\n"
-                f"CONTEXT_JSON:\n{context_json}\n\n"
-                f"患者问题：{question}"
-            ),
-        },
-    ]
+    # 对话历史要排在当前问题之前，否则模型看到的顺序是"先问后答"
+    messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in (history or [])[-6:]:
+        role = turn.get("role")
+        content = (turn.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({
+        "role": "user",
+        "content": (
+            "结构化患者上下文如下。档案事实以它为准；通用医学常识按系统说明单独成段写。\n\n"
+            f"CONTEXT_JSON:\n{context_json}\n\n"
+            f"患者问题：{question}"
+        ),
+    })
     return context_payload, messages, used, fact_values
 
 
@@ -548,13 +549,7 @@ async def answer_question(
     history: list[dict[str, str]] | None = None,
     route=None,
 ) -> dict[str, Any]:
-    context_payload, messages, used, fact_values = await _prepare(question, events, route)
-
-    for turn in (history or [])[-6:]:
-        role = turn.get("role")
-        content = (turn.get("content") or "").strip()
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
+    context_payload, messages, used, fact_values = await _prepare(question, events, route, history)
 
     client = _client()
     completion = await client.chat.completions.create(
@@ -592,13 +587,7 @@ async def answer_question_stream(
     route=None,
 ) -> AsyncIterator[dict[str, Any]]:
     """流式版本：先 yield 路由/上下文元数据，再逐块 yield 答案文本，最后 yield 校验结果。"""
-    context_payload, messages, used, fact_values = await _prepare(question, events, route)
-
-    for turn in (history or [])[-6:]:
-        role = turn.get("role")
-        content = (turn.get("content") or "").strip()
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
+    context_payload, messages, used, fact_values = await _prepare(question, events, route, history)
 
     # 先推元数据，让前端知道路由结果和有哪些 fact_id
     yield {

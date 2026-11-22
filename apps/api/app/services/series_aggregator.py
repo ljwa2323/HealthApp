@@ -50,6 +50,7 @@ class MedicationState:
     route: str | None = None
     quantity: str | None = None
     courses: list[MedicationCourse] = field(default_factory=list)
+    fact_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -337,6 +338,7 @@ def aggregate_context(
             route=_latest_attr(entries, "route"),
             quantity=_latest_attr(entries, "quantity"),
             courses=[MedicationCourse(**course) for course in courses],
+            fact_ids=list(dict.fromkeys(fact.fact_id for _, fact in entries if fact.fact_id)),
         ))
 
     # recent_events 简单去重
