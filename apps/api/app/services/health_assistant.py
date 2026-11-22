@@ -486,49 +486,151 @@ def check_advice_answer(
     return flags
 
 
+_MED_REQUIRED_FIELDS = ("dose", "frequency", "route", "since")
+_PROC_REQUIRED_FIELDS = ("date", "institution")
+
+
+def _in_time_window(value: str | None, window: dict | None) -> bool:
+    """记录日期有没有落在这次问的时间范围里。没有时间范围或记录没日期都算不出去。"""
+    if not window or not value:
+        return True
+    start, end = window.get("start"), window.get("end")
+    if not start and not end:
+        return True
+    value = str(value)[:10]
+    if start and value < start:
+        return False
+    if end and value > end:
+        return False
+    return True
+
+
+def _evidence_base(context: dict[str, Any]) -> tuple[float, str]:
+    """先定证据来源：结构化 fact > 叙述记录 > 只有上下文旁证。"""
+    lookup = context.get("lookup_result")
+    window = context.get("time_window")
+
+    if lookup:
+        matched = lookup.get("matched") or []
+        if matched:
+            structured = [item for item in matched if item.get("fact_id")]
+            narrative_only = [item for item in matched if not item.get("fact_id")]
+            base = 0.80 if structured else 0.60
+            reason = "记录齐全" if structured else "来自叙述记录，没有结构化单据"
+
+            # 关键字段齐不齐：用药看剂量/频次/用法/起始，手术看日期/医院
+            fields = _MED_REQUIRED_FIELDS if lookup.get("kind") == "medication" else _PROC_REQUIRED_FIELDS
+            missing: list[str] = []
+            # 只查结构化记录：叙述记录本来就没有医院这类字段，缺了不算数据缺口
+            for item in (structured or matched):
+                have = [f for f in fields if item.get(f)]
+                if len(have) == len(fields):
+                    continue
+                if lookup.get("kind") == "medication" and len(have) >= 2:
+                    continue  # 用药有剂量和频次就够说清楚，缺用法不扣
+                missing = [f for f in fields if not item.get(f)]
+                break
+            if missing:
+                label = f"缺{_FIELD_LABELS.get(missing[0], missing[0])}"
+                reason = f"记录不全，{label}" if structured else f"{reason}，{label}"
+                base -= 0.05
+
+            # 只有一条记录：说得清"有没有"，但撑不起趋势
+            if len(matched) == 1 and base >= 0.8:
+                base -= 0.05
+                if "缺" not in reason:
+                    reason = "记录齐全，但只有一次记录"
+            elif len(matched) >= 2:
+                base += 0.05
+
+            # 记录不在问的时间范围里，说"最近三个月"其实查的是老记录
+            values = [
+                item.get("since") or item.get("date") or ""
+                for item in matched
+            ]
+            if window and any(not _in_time_window(v, window) for v in values) and any(values):
+                base -= 0.10
+                reason = f"{reason}，部分记录不在你问的时间范围内"
+
+            if narrative_only and structured:
+                reason += "；另有叙述记录"
+            return min(0.9, base), reason
+
+        if lookup.get("candidates"):
+            return 0.45, "只有相近候选，没有对上具体药名"
+        return 0.30, "档案里没有相关记录"
+
+    series = context.get("series") or []
+    if series:
+        points = [p for s in series for p in s.get("points", [])]
+        dated = [p for p in points if p.get("t")]
+        if points and len(dated) == len(points):
+            return 0.70, "数据点都有日期"
+        if dated:
+            return 0.55, "部分数据点没有日期"
+        return 0.45, "数据点没有日期"
+
+    notes = context.get("clinical_notes") or []
+    procedures = context.get("procedures") or []
+    if notes or procedures:
+        return 0.45, "只能依据少量记录"
+    return 0.35, "档案里没有可用的记录"
+
+
+_FIELD_LABELS = {
+    "dose": "剂量",
+    "frequency": "频次",
+    "route": "用法",
+    "since": "起始日期",
+    "date": "日期",
+    "institution": "医院",
+}
+
+
+def assess_confidence(
+    context: dict[str, Any],
+    citation_check: dict[str, Any] | None = None,
+) -> tuple[float, str]:
+    """(置信度, 一句话原因)。
+
+    置信度回答的是"这条答案有多少被档案证实"，不是"档案里数据多不多"：
+    先按证据来源定基线，再按字段完整度微调，最后套硬上限。
+    """
+    score, reason = _evidence_base(context)
+
+    gaps = context.get("data_gaps") or []
+    # 检索已经命中的，缺的是别的项目，不该拿它压这次答案
+    if gaps and score < 0.75:
+        score -= min(len(gaps) * 0.02, 0.10)
+
+    if citation_check:
+        if citation_check.get("mismatched_values"):
+            score = min(score, 0.40)
+            reason = "回答数值与记录不一致"
+        if citation_check.get("hallucination_count"):
+            score = min(score, 0.50)
+            reason = "回答引用了不存在的记录"
+        if citation_check.get("lookup_conflict"):
+            score = min(score, 0.45)
+            reason = "回答与检索结果对不上"
+
+    return round(max(0.1, min(0.95, score)), 2), reason
+
+
 def compute_confidence(
     context: dict[str, Any],
     citation_check: dict[str, Any] | None = None,
 ) -> float:
-    """
-    根据本次上下文的数据丰富度估算置信度（0.1 ~ 0.95）。
-    - 基础分 0.3
-    - 命中的 series 数量加分
-    - 有日期的数据点占比加分
-    - 有幻觉引用扣分
-    - data_gaps 越多扣分
-    """
-    score = 0.4
-
-    series = context.get("series") or []
-    score += min(len(series) * 0.02, 0.2)
-
-    dated = 0
-    total_points = 0
-    for s in series:
-        for p in s.get("points", []):
-            total_points += 1
-            if p.get("t"):
-                dated += 1
-    if total_points:
-        score += (dated / total_points) * 0.15
-
-    gaps = context.get("data_gaps") or []
-    score -= len(gaps) * 0.02
-
-    if citation_check and citation_check.get("hallucination_count"):
-        score -= 0.1 * citation_check["hallucination_count"]
-
-    return round(max(0.1, min(0.95, score)), 2)
+    return assess_confidence(context, citation_check)[0]
 
 
-def confidence_footer(confidence: float) -> str:
-    """一句话收尾，不再复述上文已经写过的内容。"""
-    if confidence >= 0.8:
-        return f"\n\n置信度 {confidence:.2f} · 仅供参考，具体请咨询医生"
-    if confidence >= 0.5:
-        return f"\n\n置信度 {confidence:.2f} · 资料不全，仅供参考"
-    return f"\n\n置信度 {confidence:.2f} · 资料不足，仅供参考"
+def confidence_footer(confidence: float, reason: str | None = None) -> str:
+    """一句话收尾：分数 + 缺在哪 + 免责，别复述上文。"""
+    parts = [f"置信度 {confidence:.2f}"]
+    if reason:
+        parts.append(reason)
+    parts.append("仅供参考，具体请咨询医生")
+    return "\n\n" + " · ".join(parts)
 
 
 async def _prepare(
@@ -603,8 +705,8 @@ async def answer_question(
     advice_flags = check_advice_answer(answer, context_payload.get("question_type"), question)
     if advice_flags:
         citations["advice_flags"] = advice_flags
-    confidence = compute_confidence(context_payload, citations)
-    answer = answer + confidence_footer(confidence)
+    confidence, reason = assess_confidence(context_payload, citations)
+    answer = answer + confidence_footer(confidence, reason)
 
     return {
         "answer": answer,
@@ -658,8 +760,8 @@ async def answer_question_stream(
     advice_flags = check_advice_answer(full_answer, context_payload.get("question_type"), question)
     if advice_flags:
         citations["advice_flags"] = advice_flags
-    confidence = compute_confidence(context_payload, citations)
-    footer = confidence_footer(confidence)
+    confidence, reason = assess_confidence(context_payload, citations)
+    footer = confidence_footer(confidence, reason)
     full_answer = full_answer + footer
     yield {"type": "chunk", "text": footer}
     yield {
